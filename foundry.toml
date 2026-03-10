@@ -1,0 +1,32 @@
+[profile.default]
+solc_version="0.8.31"
+src = "src"
+out = "out"
+libs = ["lib"]
+
+[lint]
+# Ignore the entire lib folder
+ignore = ["lib/*"]
+exclude_lints = ["unwrapped-modifier-logic"]
+
+# REQUIRED by oz-foundry-upgrades:
+build_info = true
+ast = true
+extra_output = ["storageLayout"]
+# (optional but handy)
+extra_output_files = ["metadata"]
+
+optimizer = true
+optimizer_runs = 1 #need to use 1 to stay under contract size limit
+ffi = true
+
+[rpc_endpoints]
+polygon = "${POLYGON_RPC_URL}"
+
+[fmt]
+line_length = 150
+quote_style = 'single'
+single_line_statement_blocks = 'preserve'
+bracket_spacing = true
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
