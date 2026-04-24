@@ -4,11 +4,6 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
-[lint]
-# Ignore the entire lib folder
-ignore = ["lib/*"]
-exclude_lints = ["unwrapped-modifier-logic"]
-
 # REQUIRED by oz-foundry-upgrades:
 build_info = true
 ast = true
@@ -20,8 +15,16 @@ optimizer = true
 optimizer_runs = 1 #need to use 1 to stay under contract size limit
 ffi = true
 
+[lint]
+# Ignore the entire lib folder
+ignore = ["lib/*"]
+exclude_lints = ["unwrapped-modifier-logic"]
+
 [rpc_endpoints]
 polygon = "${POLYGON_RPC_URL}"
+
+[etherscan]
+polygon = { key = "${ETHERSCAN_API_KEY}", chain = 137 }
 
 [fmt]
 line_length = 150
