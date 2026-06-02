@@ -28,7 +28,7 @@ abstract contract AccountingMixin is Initializable, ERC1155Upgradeable, Reentran
     uint256 public constant DEFAULT_TWAP_GRACE_PERIOD = 60;
 
     /// @notice Maximum allowed TWAP grace period (in seconds)
-    uint256 public constant MAX_TWAP_GRACE_PERIOD = 120;
+    uint256 public constant MAX_TWAP_GRACE_PERIOD = 240; // 4 minutes
 
     // ============ ERC-7201 Namespaced Storage ============
 
@@ -122,8 +122,8 @@ abstract contract AccountingMixin is Initializable, ERC1155Upgradeable, Reentran
     function _getMarketAssets(bytes32 conditionId) internal view virtual returns (uint256 yesAssets, uint256 noAssets) {
         DataTypes.MarketState storage market = _getAccountingStorage().markets[conditionId];
         DataTypes.IndexResult memory r = _calculateIndexesCurrent(conditionId, DataTypes.PRICE_SCALE + 1);
-        yesAssets = ShareMath.sharesToAssetsWithIndex(market.totalSharesYes, r.lossIndexYes, false);
-        noAssets = ShareMath.sharesToAssetsWithIndex(market.totalSharesNo, r.lossIndexNo, false);
+        yesAssets = ShareMath.sharesToAssetsWithIndex(market.totalSharesYes, r.lossIndexYes);
+        noAssets = ShareMath.sharesToAssetsWithIndex(market.totalSharesNo, r.lossIndexNo);
     }
 
     /// @notice Returns the current loss and yield indexes for a market given a TWAP price
@@ -154,8 +154,8 @@ abstract contract AccountingMixin is Initializable, ERC1155Upgradeable, Reentran
     function _getUserAssets(address user, bytes32 conditionId) internal view virtual returns (uint256 yesAssets, uint256 noAssets) {
         DataTypes.IndexResult memory r = _calculateIndexesCurrent(conditionId, DataTypes.PRICE_SCALE + 1);
         (uint256 userSharesYes, uint256 userSharesNo) = _getUserShares(user, conditionId);
-        yesAssets = ShareMath.sharesToAssetsWithIndex(userSharesYes, r.lossIndexYes, false);
-        noAssets = ShareMath.sharesToAssetsWithIndex(userSharesNo, r.lossIndexNo, false);
+        yesAssets = ShareMath.sharesToAssetsWithIndex(userSharesYes, r.lossIndexYes);
+        noAssets = ShareMath.sharesToAssetsWithIndex(userSharesNo, r.lossIndexNo);
     }
 
     /// @notice Returns the pending USDC yield for a user in a market
@@ -199,7 +199,7 @@ abstract contract AccountingMixin is Initializable, ERC1155Upgradeable, Reentran
     function _previewDeposit(bytes32 conditionId, DataTypes.Side side, uint256 amount) internal view virtual returns (uint256 shares) {
         DataTypes.IndexResult memory r = _calculateIndexesCurrent(conditionId, DataTypes.PRICE_SCALE + 1);
         uint256 lossIndex = side == DataTypes.Side.YES ? r.lossIndexYes : r.lossIndexNo;
-        shares = ShareMath.assetsToSharesWithIndex(amount, lossIndex, false);
+        shares = ShareMath.assetsToSharesWithIndex(amount, lossIndex);
     }
 
     /// @notice Returns the asset value of a given number of shares
@@ -207,7 +207,7 @@ abstract contract AccountingMixin is Initializable, ERC1155Upgradeable, Reentran
     function _getShareValue(bytes32 conditionId, DataTypes.Side side, uint256 shares) internal view virtual returns (uint256 assets) {
         DataTypes.IndexResult memory r = _calculateIndexesCurrent(conditionId, DataTypes.PRICE_SCALE + 1);
         uint256 lossIndex = side == DataTypes.Side.YES ? r.lossIndexYes : r.lossIndexNo;
-        assets = ShareMath.sharesToAssetsWithIndex(shares, lossIndex, false);
+        assets = ShareMath.sharesToAssetsWithIndex(shares, lossIndex);
     }
 
     /// @notice Previews the token assets and yield USDC returned from a withdrawal
@@ -230,12 +230,12 @@ abstract contract AccountingMixin is Initializable, ERC1155Upgradeable, Reentran
         DataTypes.IndexResult memory r = _calculateIndexesCurrent(conditionId, twapPriceYes);
 
         if (side == DataTypes.Side.YES) {
-            tokenAssets = ShareMath.sharesToAssetsWithIndex(sharesToBurn, r.lossIndexYes, false);
+            tokenAssets = ShareMath.sharesToAssetsWithIndex(sharesToBurn, r.lossIndexYes);
             uint256 yieldDelta = r.yieldPerShareYes > userState.yieldSnapshotYes ? r.yieldPerShareYes - userState.yieldSnapshotYes : 0;
             yieldUsdc = sharesToBurn.mulDiv(yieldDelta, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
             yieldUsdc = yieldUsdc.mulDiv(r.yieldReductionFactor, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
         } else {
-            tokenAssets = ShareMath.sharesToAssetsWithIndex(sharesToBurn, r.lossIndexNo, false);
+            tokenAssets = ShareMath.sharesToAssetsWithIndex(sharesToBurn, r.lossIndexNo);
             uint256 yieldDelta = r.yieldPerShareNo > userState.yieldSnapshotNo ? r.yieldPerShareNo - userState.yieldSnapshotNo : 0;
             yieldUsdc = sharesToBurn.mulDiv(yieldDelta, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
             yieldUsdc = yieldUsdc.mulDiv(r.yieldReductionFactor, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
@@ -361,12 +361,6 @@ abstract contract AccountingMixin is Initializable, ERC1155Upgradeable, Reentran
         uint256 oldGracePeriod = $.twapGracePeriod;
         $.twapGracePeriod = gracePeriod;
         emit TwapGracePeriodUpdated(oldGracePeriod, gracePeriod);
-    }
-
-    /// @notice Set the Twap Oracle
-    /// @param twapOracle_ The Twap Oracle address
-    function _setTwapOracle(address twapOracle_) internal {
-        _getAccountingStorage().twapOracle = IRobinTwapOracle(twapOracle_);
     }
 
     /// @notice Handle the accounting updates for a share transfer (delegated to AccountingLib)

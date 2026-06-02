@@ -53,6 +53,9 @@ library StorageLib {
         address underlyingUsdc;
         // Emergency mode
         bool emergencyMode; // If true, no vault deposits, Usdc stays in contract
+        // When true, the forward-looking internal-capacity guard in `_batchDeposit` is skipped.
+        // The external-capacity guard in `_supplyToVaults` is still checked.
+        bool internalCapacityCheckDisabled;
     }
 
     bytes32 internal constant YIELDSTRATEGY_STORAGE_LOCATION = 0xd8eb9ade092aa0dc31a799bb7e00aef9dc4ce6cbdc1173946b33cbcbb48c9c00;
@@ -70,13 +73,25 @@ library StorageLib {
         // Polymarket infrastructure addresses
         IConditionalTokens ctf; // Conditional Tokens Framework
         INegRiskAdapter negRiskAdapter;
-        IRegistry negRiskCtfExchange;
-        IRegistry ctfExchange;
+        IRegistry negRiskCtfExchange; // Legacy: kept for storage compatibility, no longer read.
+        IRegistry ctfExchange; // Legacy: kept for storage compatibility, no longer read.
         address underlyingUsdc; // Usdc.e
         address polymarketWcol; // WCOL
         uint256 maximumAdditionalMatchedTokens; // Total amount of matched tokens that could additionally be paired
         // Per-market Polymarket token info: conditionId => PolymarketTokenInfo
         mapping(bytes32 => DataTypes.PolymarketTokenInfo) tokenInfo;
+        // Ordered list of Polymarket non-negRisk oracles paired with the collateral that markets
+        // prepared by each oracle use (USDC.e or PolyUSD). The first match wins in
+        // `_decideVaultMode`, so place the most common entry first. Two to three entries expected
+        // in production.
+        DataTypes.PolymarketOracle[] polymarketOracles;
+        // Polymarket CollateralOnramp address. Used to wrap USDC.e into PolyUSD on the split path
+        // for PolyUSD-backed markets, and to wrap USDC.e yield into PolyUSD when the user opts in
+        // via the `wrapYieldToPolyUsd` flag on withdrawal. Zero → wrap is rejected.
+        address polymarketOnramp;
+        // Polymarket CollateralOfframp address. Used to unwrap PolyUSD back to USDC.e after merging
+        // PolyUSD-backed outcome tokens. Zero → PolyUSD-backed merges revert.
+        address polymarketOfframp;
     }
 
     bytes32 internal constant POLYMARKET_STORAGE_LOCATION = 0x996716fa23045e0aecf8c8f0b6f4eb21669555365c754469b4d4dd3e1cee6a00;

@@ -5,4 +5,10 @@ bytes32 constant DEFAULT_MANAGER_ROLE = keccak256('DEFAULT_MANAGER_ROLE');
 bytes32 constant FEE_HARVESTER_ROLE = keccak256('FEE_HARVESTER_ROLE');
 bytes32 constant TIMELOCKED_ROLE = keccak256('TIMELOCKED_ROLE');
 bytes32 constant PAUSER_ROLE = keccak256('PAUSER_ROLE');
+bytes32 constant OPERATOR_ROLE = keccak256('OPERATOR_ROLE');
+
+/// @dev Deprecated: kept only so existing scripts/imports still compile. No function in the
+///      contracts checks this role any more; its responsibilities were split between
+///      TIMELOCKED_ROLE (addVault), DEFAULT_MANAGER_ROLE (cap/active/remove/swap), and
+///      OPERATOR_ROLE (emergency mode, internal-capacity toggle).
 bytes32 constant EXTERNAL_VAULT_MANAGER_ROLE = keccak256('EXTERNAL_VAULT_MANAGER_ROLE');

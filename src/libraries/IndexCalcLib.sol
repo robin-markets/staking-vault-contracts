@@ -15,7 +15,9 @@ library IndexCalcLib {
 
     /// @notice Internal helper to calculate loss indexes and yield-per-share with specific pool assets value
     /// @dev For GAINS: only yieldPerShare increases (TWAP-weighted split). lossIndex unchanged.
-    ///      For LOSSES: only lossIndex decreases (full delta to both sides). yieldPerShare unchanged.
+    ///      For LOSSES: the paired-backed portion of the loss (min(delta, pairableTokens)) is
+    ///      applied equally to both lossIndexes; any excess past pairable backing is absorbed by
+    ///      yieldReductionFactor instead. yieldPerShare unchanged.
     /// @param market Market state snapshot (copied from storage by the caller)
     /// @param input Calculation parameters (pool state, TWAP data, timestamp)
     /// @return result Computed index result with loss indexes, yield per share, and reduction factor
@@ -56,8 +58,8 @@ library IndexCalcLib {
 
         if (vars.isGain) {
             // For GAINS: Split by TWAP weighting, only update yieldPerShare
-            vars.yesBaseline = ShareMath.sharesToAssetsWithIndex(vars.totalSharesYes, result.lossIndexYes, false);
-            vars.noBaseline = ShareMath.sharesToAssetsWithIndex(vars.totalSharesNo, result.lossIndexNo, false);
+            vars.yesBaseline = ShareMath.sharesToAssetsWithIndex(vars.totalSharesYes, result.lossIndexYes);
+            vars.noBaseline = ShareMath.sharesToAssetsWithIndex(vars.totalSharesNo, result.lossIndexNo);
 
             if (input.twapPriceYes <= DataTypes.PRICE_SCALE && input.currentTimestamp > input.lastTwapUpdate) {
                 // View-function path: simulate what the accumulator WOULD be if a TWAP update happened now
@@ -70,6 +72,13 @@ library IndexCalcLib {
                 // TWAP was already applied to storage before calling this.
                 vars.twapAccumulatorYesDelta = input.twapAccumulatorYes - market.lastYieldTwapCheckpointYes;
                 vars.timeDelta = input.lastTwapUpdate - market.lastYieldTimestamp;
+
+                // Fallback to last twap when no fresh TWAP has been submitted since the last yield update
+                // This can happen during the GRACE_PERIOD
+                if (vars.timeDelta == 0) {
+                    vars.timeDelta = 1;
+                    vars.twapAccumulatorYesDelta = uint256(market.lastTwapPriceYes);
+                }
             }
 
             (vars.yesDelta, vars.noDelta) =
@@ -83,18 +92,21 @@ library IndexCalcLib {
                 result.yieldPerShareNo += vars.noDelta.mulDiv(DataTypes.INDEX_SCALE, vars.totalSharesNo, Math.Rounding.Floor);
             }
         } else {
-            // For LOSSES: Full delta applied to BOTH sides equally.
-            // This is because the vault holds USDC from merged token pairs (1 USDC = 1 YES + 1 NO).
+            // For LOSSES: the paired-backed portion of the loss is applied equally to both
+            // sides' lossIndexes. The vault holds USDC from merged token pairs (1 USDC = 1 YES + 1 NO),
             // When X USDC is lost, the vault can produce X fewer YES tokens AND X fewer NO tokens
             // on withdrawal (since splitting X USDC creates X YES + X NO simultaneously).
-            vars.yesDelta = vars.delta;
-            vars.noDelta = vars.delta;
 
             // Calculate token assets before loss (needed to detect if loss exceeds pairable backing)
             uint256 yesTokenAssets =
                 vars.totalSharesYes > 0 ? vars.totalSharesYes.mulDiv(result.lossIndexYes, DataTypes.INDEX_SCALE, Math.Rounding.Floor) : 0;
             uint256 noTokenAssets =
                 vars.totalSharesNo > 0 ? vars.totalSharesNo.mulDiv(result.lossIndexNo, DataTypes.INDEX_SCALE, Math.Rounding.Floor) : 0;
+
+            uint256 pairableTokens = yesTokenAssets < noTokenAssets ? yesTokenAssets : noTokenAssets;
+            uint256 lossToIndex = vars.delta < pairableTokens ? vars.delta : pairableTokens;
+            vars.yesDelta = lossToIndex;
+            vars.noDelta = lossToIndex;
 
             // Decrease lossIndex (token value reduction), allow reaching 0
             if (vars.totalSharesYes > 0 && vars.yesDelta > 0) {

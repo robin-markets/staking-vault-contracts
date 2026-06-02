@@ -86,6 +86,25 @@ contract RobinLens is IRobinLens {
     }
 
     /// @inheritdoc IRobinLens
+    function batchGetUserSharesAndAssets(address user, bytes32[] calldata conditionIds)
+        external
+        view
+        returns (uint256[] memory yesShares, uint256[] memory noShares, uint256[] memory yesAssets, uint256[] memory noAssets)
+    {
+        IRobinStakingVault v = IRobinStakingVault(vault);
+        uint256 len = conditionIds.length;
+        yesShares = new uint256[](len);
+        noShares = new uint256[](len);
+        yesAssets = new uint256[](len);
+        noAssets = new uint256[](len);
+
+        for (uint256 i = 0; i < len; i++) {
+            (yesShares[i], noShares[i]) = v.getUserShares(user, conditionIds[i]);
+            (yesAssets[i], noAssets[i]) = v.getUserAssets(user, conditionIds[i]);
+        }
+    }
+
+    /// @inheritdoc IRobinLens
     function batchGetUserYield(address user, bytes32[] calldata conditionIds, uint256[] calldata twapPricesYes)
         external
         view

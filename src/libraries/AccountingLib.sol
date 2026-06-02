@@ -98,6 +98,7 @@ library AccountingLib {
         market.yieldReductionFactor = uint128(DataTypes.INDEX_SCALE);
 
         market.lastYieldTimestamp = currentTime;
+        market.lastTwapPriceYes = uint64(DataTypes.PRICE_SCALE / 2);
 
         // Store token Ids
         uint256 tokenIdYes = getTokenId(conditionId, DataTypes.Side.YES);
@@ -127,18 +128,31 @@ library AccountingLib {
         uint256 gracePeriod = $.twapGracePeriod;
         if (timeDelta > gracePeriod) revert IRobinStakingVaultErrors.TwapGracePeriodExceedsMax(timeDelta, gracePeriod);
 
+        uint256 tpa = $.totalPoolAssets;
+        uint256 tps = $.totalPoolShares;
         // Calculate indexes
         DataTypes.IndexResult memory r = IndexCalcLib.calculateIndexes(
             market,
             DataTypes.IndexCalcInput({
-                totalPoolShares: $.totalPoolShares,
-                totalPoolAssets: $.totalPoolAssets,
+                totalPoolShares: tps,
+                totalPoolAssets: tpa,
                 twapAccumulatorYes: twapAccumulatorYes,
                 lastTwapUpdate: lastTwapUpdate,
                 twapPriceYes: DataTypes.PRICE_SCALE + 1,
                 currentTimestamp: block.timestamp
             })
         );
+
+        // If a fresh TWAP submission has happened since the previous update, capture the avg Yes Price.
+        // This is reused by `IndexCalcLib` as the split fallback
+        {
+            uint256 lastYieldTimestamp = market.lastYieldTimestamp;
+            if (lastTwapUpdate > lastYieldTimestamp) {
+                uint256 period = lastTwapUpdate - uint256(lastYieldTimestamp);
+                uint256 accDelta = twapAccumulatorYes - uint256(market.lastYieldTwapCheckpointYes);
+                market.lastTwapPriceYes = uint64(accDelta / period);
+            }
+        }
 
         // If no index changed, still advance the TWAP checkpoint to avoid re-processing the same period.
         // This happens when marketValue == principalContributed (no gain or loss).
@@ -165,7 +179,16 @@ library AccountingLib {
         market.principalContributed = r.marketValue;
 
         emit IRobinStakingVaultEvents.IndexesUpdated(
-            conditionId, r.lossIndexYes, r.lossIndexNo, r.yieldPerShareYes, r.yieldPerShareNo, r.yieldReductionFactor, r.marketValue
+            conditionId,
+            r.lossIndexYes,
+            r.lossIndexNo,
+            r.yieldPerShareYes,
+            r.yieldPerShareNo,
+            r.yieldReductionFactor,
+            r.marketValue,
+            market.marketPoolShares,
+            tpa,
+            tps
         );
     }
 
@@ -192,24 +215,29 @@ library AccountingLib {
 
         tokenId = uint256(keccak256(abi.encodePacked(conditionId, uint8(side))));
 
+        uint128 newSnapshot;
         if (side == DataTypes.Side.YES) {
             if (market.lossIndexYes == 0) revert IRobinStakingVaultErrors.MarketSideBroken();
             // Calculate shares at current loss index
-            shares = ShareMath.assetsToSharesWithIndex(assets, market.lossIndexYes, false);
+            shares = ShareMath.assetsToSharesWithIndex(assets, market.lossIndexYes);
             if (shares == 0) revert IRobinStakingVaultErrors.ZeroAmount();
             // Record weighted-average yield snapshot before minting
-            userState.yieldSnapshotYes = uint128(_weightedAverageSnapshot(userState.yieldSnapshotYes, oldShares, market.yieldPerShareYes, shares));
+            newSnapshot = uint128(_weightedAverageSnapshot(userState.yieldSnapshotYes, oldShares, market.yieldPerShareYes, shares));
+            userState.yieldSnapshotYes = newSnapshot;
             // Update total shares, weighted snapshot tracking
             market.totalSharesYes += shares;
             market.totalWeightedSnapshotYes += shares * uint256(market.yieldPerShareYes);
         } else {
             if (market.lossIndexNo == 0) revert IRobinStakingVaultErrors.MarketSideBroken();
-            shares = ShareMath.assetsToSharesWithIndex(assets, market.lossIndexNo, false);
+            shares = ShareMath.assetsToSharesWithIndex(assets, market.lossIndexNo);
             if (shares == 0) revert IRobinStakingVaultErrors.ZeroAmount();
-            userState.yieldSnapshotNo = uint128(_weightedAverageSnapshot(userState.yieldSnapshotNo, oldShares, market.yieldPerShareNo, shares));
+            newSnapshot = uint128(_weightedAverageSnapshot(userState.yieldSnapshotNo, oldShares, market.yieldPerShareNo, shares));
+            userState.yieldSnapshotNo = newSnapshot;
             market.totalSharesNo += shares;
             market.totalWeightedSnapshotNo += shares * uint256(market.yieldPerShareNo);
         }
+
+        emit IRobinStakingVaultEvents.UserYieldSnapshotUpdated(user, conditionId, side, newSnapshot);
     }
 
     /// @notice Compute and apply burn shares accounting. Caller must call ERC1155._burn after.
@@ -239,7 +267,7 @@ library AccountingLib {
 
         if (side == DataTypes.Side.YES) {
             // Token assets via lossIndex (loss-adjusted only, no yield baked in)
-            tokenAssets = ShareMath.sharesToAssetsWithIndex(shares, market.lossIndexYes, false);
+            tokenAssets = ShareMath.sharesToAssetsWithIndex(shares, market.lossIndexYes);
             // USDC yield from yieldPerShare delta, scaled by reduction factor
             uint256 yieldDelta = market.yieldPerShareYes > userState.yieldSnapshotYes ? market.yieldPerShareYes - userState.yieldSnapshotYes : 0;
             yieldUsdc = shares.mulDiv(yieldDelta, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
@@ -252,7 +280,7 @@ library AccountingLib {
                 contributionYes < market.totalWeightedSnapshotYes ? market.totalWeightedSnapshotYes - contributionYes : 0;
             market.totalSharesYes -= shares;
         } else {
-            tokenAssets = ShareMath.sharesToAssetsWithIndex(shares, market.lossIndexNo, false);
+            tokenAssets = ShareMath.sharesToAssetsWithIndex(shares, market.lossIndexNo);
             uint256 yieldDelta = market.yieldPerShareNo > userState.yieldSnapshotNo ? market.yieldPerShareNo - userState.yieldSnapshotNo : 0;
             yieldUsdc = shares.mulDiv(yieldDelta, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
             yieldUsdc = yieldUsdc.mulDiv(market.yieldReductionFactor, DataTypes.INDEX_SCALE, Math.Rounding.Floor);

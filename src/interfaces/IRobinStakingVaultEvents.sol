@@ -47,7 +47,7 @@ interface IRobinStakingVaultEvents {
 
     // ============ Yield Index Events ============
 
-    /// @notice Emitted when loss and yield indexes are updated for a market
+    /// @notice Emitted when loss and yield indexes are updated for a market.
     event IndexesUpdated(
         bytes32 indexed conditionId,
         uint256 lossIndexYes,
@@ -55,7 +55,10 @@ interface IRobinStakingVaultEvents {
         uint256 yieldPerShareYes,
         uint256 yieldPerShareNo,
         uint256 yieldReductionFactor,
-        uint256 principalContributed
+        uint256 principalContributed,
+        uint256 marketPoolShares,
+        uint256 totalPoolAssets,
+        uint256 totalPoolShares
     );
 
     // ============ Vault Management Events ============
@@ -94,6 +97,9 @@ interface IRobinStakingVaultEvents {
     /// @notice Emitted when emergency mode is toggled
     event EmergencyModeUpdated(bool enabled);
 
+    /// @notice Emitted when the forward-looking internal-capacity guard on deposits is toggled
+    event InternalCapacityCheckDisabledUpdated(bool disabled);
+
     /// @notice Emitted when a vault's emergency mode is toggled
     event VaultEmergencyUpdated(address indexed vault, bool emergencyActivated);
 
@@ -129,6 +135,18 @@ interface IRobinStakingVaultEvents {
         uint128 receiverYieldSnapshot
     );
 
+    /// @notice Emitted when a user's per-side yield snapshot is written when minting shares.
+    /// @param user User whose snapshot was updated
+    /// @param conditionId Market condition ID
+    /// @param side YES or NO
+    /// @param yieldSnapshot New snapshot value
+    event UserYieldSnapshotUpdated(address indexed user, bytes32 indexed conditionId, DataTypes.Side side, uint128 yieldSnapshot);
+
+    /// @notice Emitted when the Metadata URI of ERC1155Upgradeable changed
+    /// @param oldUri old uri
+    /// @param newUri new uri
+    event ERC1155MetadataUriChanged(string oldUri, string newUri);
+
     // ============ Market Events ============
 
     /// @notice Emitted when a new market is auto-initialized on first deposit
@@ -142,6 +160,21 @@ interface IRobinStakingVaultEvents {
     /// @notice Emitted when Usdc is split back to outcome tokens
     event TokensSplit(bytes32 indexed conditionId, uint256 usdcAmount, uint256 tokensReceived);
 
+    /// @notice Emitted when a Polymarket oracle is added to the recognised list
+    event PolymarketOracleAdded(address indexed oracle, address indexed collateral, uint256 index);
+
+    /// @notice Emitted when a Polymarket oracle is removed from the recognised list
+    event PolymarketOracleRemoved(address indexed oracle);
+
+    /// @notice Emitted when two Polymarket oracles swap positions in the priority list
+    event PolymarketOraclesSwapped(address indexed oracle1, address indexed oracle2, uint256 index1, uint256 index2);
+
+    /// @notice Emitted when the Polymarket CollateralOnramp address is updated
+    event PolymarketOnrampUpdated(address indexed oldOnramp, address indexed newOnramp);
+
+    /// @notice Emitted when the Polymarket CollateralOfframp address is updated
+    event PolymarketOfframpUpdated(address indexed oldOfframp, address indexed newOfframp);
+
     // ============ TWAP Control Events ============
 
     /// @notice Emitted when Twap grace period is updated
@@ -150,5 +183,5 @@ interface IRobinStakingVaultEvents {
     // ============ Extension Events ============
 
     /// @notice Emitted when the extension contract address is updated
-    event ExtensionAddressUpdated(address indexed newExtension);
+    event ExtensionAddressUpdated(address oldExtension, address indexed newExtension);
 }

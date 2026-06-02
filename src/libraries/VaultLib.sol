@@ -48,9 +48,8 @@ library VaultLib {
 
     /// @notice Remove a vault (withdraws all, redistributes)
     /// @param vault Address of the vault to remove
-    /// @param reservedUsdc Amount of USDC reserved (protocol fees)
     /// @return withdrawn Amount withdrawn from the vault
-    function removeVault(address vault, uint256 reservedUsdc) external returns (uint256 withdrawn) {
+    function removeVault(address vault) external returns (uint256 withdrawn) {
         StorageLib.YieldStrategyStorage storage $ = _getStorage();
 
         uint256 idx = $.vaultIndex[vault];
@@ -78,7 +77,7 @@ library VaultLib {
         // Try to redeposit to remaining vaults if not in emergency mode
         // Non-reverting: any leftover stays idle in contract
         if (!$.emergencyMode && withdrawn > 0) {
-            _trySupplyToVaults(withdrawn, reservedUsdc);
+            _trySupplyToVaults(withdrawn);
         }
     }
 
@@ -145,18 +144,20 @@ library VaultLib {
     // ============ Emergency Mode ============
 
     /// @notice Enable emergency mode (withdraw all from vaults)
+    /// @dev Sets the emergency flag BEFORE attempting external withdrawals so that a
+    ///      reverting vault cannot prevent the protocol from entering emergency mode.
     function enableEmergencyMode() external {
         StorageLib.YieldStrategyStorage storage $ = _getStorage();
 
         if ($.emergencyMode) return;
 
-        // Withdraw from all vaults
+        $.emergencyMode = true;
+        emit IRobinStakingVaultEvents.EmergencyModeUpdated(true);
+
+        // Withdraw from all vaults (non-reverting per-vault)
         for (uint256 i = 0; i < $.vaults.length; i++) {
             _withdrawMaxFromVault($.vaults[i].vault);
         }
-
-        $.emergencyMode = true;
-        emit IRobinStakingVaultEvents.EmergencyModeUpdated(true);
     }
 
     /// @notice Withdraw maximum possible from vaults during emergency
@@ -196,7 +197,9 @@ library VaultLib {
     }
 
     /// @notice Enable emergency mode for a specific vault
-    /// @dev Use when a single vault is compromised but others are safe
+    /// @dev Use when a single vault is compromised but others are safe.
+    ///      Sets the per-vault emergency flag BEFORE attempting withdrawal so a
+    ///      reverting vault cannot remain eligible for future deposits.
     /// @param vault Address of the vault to put in emergency mode
     /// @return withdrawn Amount withdrawn from the vault
     function enableVaultEmergency(address vault) external returns (uint256 withdrawn) {
@@ -209,11 +212,11 @@ library VaultLib {
         DataTypes.ExternalVault storage v = $.vaults[idx];
         if (v.emergencyActivated) return 0;
 
-        // Withdraw as much as possible from the vault
-        withdrawn = _withdrawMaxFromVault(vault);
         v.emergencyActivated = true;
-
         emit IRobinStakingVaultEvents.VaultEmergencyUpdated(vault, true);
+
+        // Withdraw as much as possible from the vault (non-reverting)
+        withdrawn = _withdrawMaxFromVault(vault);
 
         return withdrawn;
     }
@@ -250,7 +253,7 @@ library VaultLib {
     /// @param reservedUsdc Amount of USDC reserved (protocol fees)
     function supplyToVaults(uint256 reservedUsdc) external {
         uint256 toBeSupplied = _getIdleUsdc(reservedUsdc);
-        uint256 remaining = _trySupplyToVaults(toBeSupplied, reservedUsdc);
+        uint256 remaining = _trySupplyToVaults(toBeSupplied);
         if (remaining > 0) {
             revert IRobinStakingVaultErrors.SupplyOverflow(remaining, toBeSupplied);
         }
@@ -263,7 +266,7 @@ library VaultLib {
     function trySupplyIdleToVaults(uint256 reservedUsdc) external returns (uint256 remaining) {
         uint256 idle = _getIdleUsdc(reservedUsdc);
         if (idle == 0) return 0;
-        remaining = _trySupplyToVaults(idle, reservedUsdc);
+        remaining = _trySupplyToVaults(idle);
     }
 
     /// @notice Ensure contract has enough USDC available, withdrawing from vaults if needed
@@ -285,7 +288,7 @@ library VaultLib {
         // Anything above "amount" is excess
         if (currentAvailable > amount) {
             uint256 excess = currentAvailable - amount;
-            _trySupplyToVaults(excess, reservedUsdc);
+            _trySupplyToVaults(excess);
         }
     }
 
@@ -300,11 +303,8 @@ library VaultLib {
     /// @notice Try to supply USDC to external vaults (non-reverting)
     /// @dev Returns remaining amount that couldn't be supplied
     /// @param amount Amount of USDC to supply
-    /// @param reservedUsdc Amount of USDC reserved — unused param kept for API consistency
     /// @return remaining Amount that couldn't be deposited
-    function _trySupplyToVaults(uint256 amount, uint256 reservedUsdc) private returns (uint256 remaining) {
-        // reservedUsdc is used only for _getIdleUsdc, not directly here
-        (reservedUsdc);
+    function _trySupplyToVaults(uint256 amount) private returns (uint256 remaining) {
         if (amount == 0) return 0;
         StorageLib.YieldStrategyStorage storage $ = _getStorage();
 
@@ -323,12 +323,11 @@ library VaultLib {
             uint256 toDeposit = remaining < canDeposit ? remaining : canDeposit;
 
             IERC20($.underlyingUsdc).forceApprove(v.vault, toDeposit);
-            uint256 shares = IERC4626(v.vault).deposit(toDeposit, address(this));
+            try IERC4626(v.vault).deposit(toDeposit, address(this)) returns (uint256 shares) {
+                emit IRobinStakingVaultEvents.VaultDeposit(v.vault, toDeposit, shares);
+                remaining -= toDeposit;
+            } catch { }
             IERC20($.underlyingUsdc).forceApprove(v.vault, 0);
-
-            emit IRobinStakingVaultEvents.VaultDeposit(v.vault, toDeposit, shares);
-
-            remaining -= toDeposit;
         }
     }
 
@@ -338,7 +337,7 @@ library VaultLib {
     function _trySupplyIdleToVaults(uint256 reservedUsdc) private returns (uint256 remaining) {
         uint256 idle = _getIdleUsdc(reservedUsdc);
         if (idle == 0) return 0;
-        remaining = _trySupplyToVaults(idle, reservedUsdc);
+        remaining = _trySupplyToVaults(idle);
     }
 
     /// @notice Withdraw USDC from external vaults
@@ -354,34 +353,43 @@ library VaultLib {
         for (uint256 i = $.vaults.length; i > 0 && remaining > 0; i--) {
             DataTypes.ExternalVault storage v = $.vaults[i - 1];
 
-            uint256 maxWithdraw = IERC4626(v.vault).maxWithdraw(address(this));
+            uint256 maxWithdraw;
+            try IERC4626(v.vault).maxWithdraw(address(this)) returns (uint256 m) {
+                maxWithdraw = m;
+            } catch {
+                continue;
+            }
             if (maxWithdraw == 0) continue;
 
             uint256 toWithdraw = remaining < maxWithdraw ? remaining : maxWithdraw;
-            // Calculate shares to redeem
-            uint256 shares = IERC4626(v.vault).withdraw(toWithdraw, address(this), address(this));
 
-            emit IRobinStakingVaultEvents.VaultWithdrawal(v.vault, shares, toWithdraw);
-
-            remaining -= toWithdraw;
+            try IERC4626(v.vault).withdraw(toWithdraw, address(this), address(this)) returns (uint256 shares) {
+                emit IRobinStakingVaultEvents.VaultWithdrawal(v.vault, shares, toWithdraw);
+                remaining -= toWithdraw;
+            } catch {
+                continue;
+            }
         }
 
         if (remaining > 0) revert IRobinStakingVaultErrors.InsufficientLiquidity(remaining);
     }
 
     /// @notice Withdraw as much as possible from a specific vault (non-reverting)
-    /// @dev does not revert
+    /// @dev Wraps both the maxWithdraw query and the withdraw call in try/catch so a
+    ///      malicious or broken vault cannot block emergency flows that call this helper.
     function _withdrawMaxFromVault(address vault) private returns (uint256 shares) {
-        uint256 maxWithdraw = IERC4626(vault).maxWithdraw(address(this));
-        if (maxWithdraw == 0) return 0;
+        try IERC4626(vault).maxWithdraw(address(this)) returns (uint256 maxWithdraw) {
+            if (maxWithdraw == 0) return 0;
 
-        shares = IERC4626(vault).withdraw(maxWithdraw, address(this), address(this));
-
-        emit IRobinStakingVaultEvents.VaultWithdrawal(vault, shares, maxWithdraw);
+            try IERC4626(vault).withdraw(maxWithdraw, address(this), address(this)) returns (uint256 sharesBurned) {
+                shares = sharesBurned;
+                emit IRobinStakingVaultEvents.VaultWithdrawal(vault, shares, maxWithdraw);
+            } catch { }
+        } catch { }
     }
 
     /// @notice Withdraw all from a specific vault (reverts if not all can be withdrawn)
-    /// @dev reverts if not all can be withdrawn
+    /// @dev reverts if not all can be withdrawn to signal that vault should not be removed
     function _withdrawAllFromVault(address vault) private returns (uint256 withdrawn) {
         uint256 shares = IERC4626(vault).balanceOf(address(this));
         if (shares == 0) return 0;
@@ -499,11 +507,18 @@ library VaultLib {
     // ============ Private Helpers ============
 
     /// @notice Get available deposit capacity for a vault
+    /// @dev maxDeposit is wrapped in try/catch: a misbehaving vault returns 0 capacity
+    ///      instead of bricking _trySupplyToVaults / getTotalAvailableCapacity.
     function _getAvailableCapacity(DataTypes.ExternalVault storage v) private view returns (uint256) {
         if (!v.active || v.emergencyActivated) return 0;
 
         // Check vault's own max deposit
-        uint256 maxDeposit = IERC4626(v.vault).maxDeposit(address(this));
+        uint256 maxDeposit;
+        try IERC4626(v.vault).maxDeposit(address(this)) returns (uint256 m) {
+            maxDeposit = m;
+        } catch {
+            return 0;
+        }
         if (maxDeposit == 0) return 0;
 
         if (v.cap == 0) {
@@ -522,10 +537,16 @@ library VaultLib {
     function _getVaultValue(address vault) private view returns (uint256) {
         uint256 shares = IERC4626(vault).balanceOf(address(this));
         //using previewRedeem instead of convertToAssets to account for withdraw fees. This means that the vault cap does not include the fees.
-        return IERC4626(vault).previewRedeem(shares);
+
+        try IERC4626(vault).previewRedeem(shares) returns (uint256 v) {
+            return v;
+        } catch {
+            return IERC4626(vault).convertToAssets(shares);
+        }
     }
 
     /// @notice Get the total USDC value across all external vaults
+    /// @dev Needs to include inactive and emergency-activated vaults for correct share valuation
     function _getTotalVaultValue() private view returns (uint256 total) {
         StorageLib.YieldStrategyStorage storage $ = _getStorage();
         for (uint256 i = 0; i < $.vaults.length; i++) {

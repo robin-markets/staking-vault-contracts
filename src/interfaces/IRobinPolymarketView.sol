@@ -24,4 +24,5 @@ interface IRobinPolymarketView {
     /// @notice Get maximum additional matched tokens across all markets
     /// @return Total maximum additional matched tokens
     function getMaximumAdditionalMatchedTokens() external view returns (uint256);
+
 }

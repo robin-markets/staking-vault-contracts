@@ -28,6 +28,12 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
     /// @inheritdoc IRobinTwapOracle
     bytes32 public constant VAULT_ROLE = keccak256('VAULT_ROLE');
 
+    /// @inheritdoc IRobinTwapOracle
+    bytes32 public constant OPERATOR_ROLE = keccak256('OPERATOR_ROLE');
+
+    /// @inheritdoc IRobinTwapOracle
+    bytes32 public constant PAUSER_ROLE = keccak256('PAUSER_ROLE');
+
     // ============ Constants ============
 
     /// @inheritdoc IRobinTwapOracle
@@ -85,6 +91,8 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
         // Grant roles
         _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
         _grantRole(DEFAULT_MANAGER_ROLE, initialOwner);
+        _grantRole(OPERATOR_ROLE, initialOwner);
+        _grantRole(PAUSER_ROLE, initialOwner);
 
         // Setup Timelock
         _grantRole(TIMELOCKED_ROLE, timelockController);
@@ -229,44 +237,39 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
             return (twapAccumulatorYes, block.timestamp);
         }
 
-        if (!isEffectiveTwapRequired(conditionId)) {
-            uint256 timeDiff = block.timestamp - market.lastTwapUpdate;
-            uint256 twapAccumulatorYesDelta = TwapMath.defaultPrice() * timeDiff;
-            twapAccumulatorYes = market.twapAccumulatorYes + twapAccumulatorYesDelta;
-            return (twapAccumulatorYes, block.timestamp);
-        }
-
         return (market.twapAccumulatorYes, market.lastTwapUpdate);
     }
 
     // ============ Admin Functions ============
 
     /// @notice Set Twap requirement for a market
-    function setMarketTwapRequired(bytes32 conditionId, bool required) public onlyRole(DEFAULT_MANAGER_ROLE) {
+    function setMarketTwapRequired(bytes32 conditionId, bool required) public onlyRole(OPERATOR_ROLE) {
         if (!isMarketInitialized(conditionId)) revert MarketNotInitialized(conditionId); //if we need to set it before initializing, call initializeMarket on the vault contract.
         _getTwapOracleStorage().markets[conditionId].twapRequired = required;
         emit MarketTwapRequirementUpdated(conditionId, required);
     }
 
     /// @inheritdoc IRobinTwapOracle
-    function setDefaultTwapRequired(bool required) public onlyRole(DEFAULT_MANAGER_ROLE) {
+    function setDefaultTwapRequired(bool required) public onlyRole(OPERATOR_ROLE) {
         _getTwapOracleStorage().defaultTwapRequired = required;
         emit DefaultTwapRequiredUpdated(required);
     }
 
     /// @inheritdoc IRobinTwapOracle
-    function setGlobalTwapRequired(bool required) public onlyRole(DEFAULT_MANAGER_ROLE) {
+    function setGlobalTwapRequired(bool required) public onlyRole(OPERATOR_ROLE) {
         _getTwapOracleStorage().globalTwapRequired = required;
         emit GlobalTwapRequiredUpdated(required);
     }
 
     /// @inheritdoc IRobinTwapOracle
-    function setGlobalTwapDisabled(bool disabled) public onlyRole(DEFAULT_MANAGER_ROLE) {
+    function setGlobalTwapDisabled(bool disabled) public onlyRole(OPERATOR_ROLE) {
         _getTwapOracleStorage().globalTwapDisabled = disabled;
         emit GlobalTwapDisabledUpdated(disabled);
     }
 
     /// @inheritdoc IRobinTwapOracle
+    /// @dev Multi-sig gated so a compromised operator EOA cannot rotate the trusted signer to
+    ///      attacker-controlled keys and submit arbitrary prices.
     function setTwapSigner(address newSigner) public onlyRole(DEFAULT_MANAGER_ROLE) {
         if (newSigner == address(0)) revert ZeroAddress();
         TwapOracleStorage storage $ = _getTwapOracleStorage();
@@ -276,12 +279,15 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
     }
 
     /// @inheritdoc IRobinTwapOracle
-    function pause() public onlyRole(DEFAULT_MANAGER_ROLE) {
+    /// @dev Pausing the oracle blocks TWAP submission, which in turn blocks deposits/withdrawals on
+    ///      TWAP-required markets. Kept on a multi-sig-only role to prevent an operator EOA from
+    ///      single-handedly freezing user exits.
+    function pause() public onlyRole(PAUSER_ROLE) {
         _pause();
     }
 
     /// @inheritdoc IRobinTwapOracle
-    function unpause() public onlyRole(DEFAULT_MANAGER_ROLE) {
+    function unpause() public onlyRole(PAUSER_ROLE) {
         _unpause();
     }
 
@@ -328,9 +334,12 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
     /// @param twapData Twap data
     function _applyTwap(bytes32 conditionId, DataTypes.TwapData memory twapData) internal {
         MarketState storage market = _getTwapOracleStorage().markets[conditionId];
-        // Early return if no time has passed (e.g. market just auto-initialized in this tx)
+        // Skip silently if data is at or before the current checkpoint (e.g. market just
+        // auto-initialized in this tx, or another tx already advanced lastTwapUpdate past
+        // this batch's endTimestamp). Checking <= here avoids an arithmetic underflow on
+        // the subsequent subtraction and lets the rest of the batch proceed.
+        if (twapData.endTimestamp <= market.lastTwapUpdate) return;
         uint256 timeDelta = twapData.endTimestamp - market.lastTwapUpdate;
-        if (timeDelta == 0) return;
 
         TwapMath._validateTwapData(twapData, market.lastTwapUpdate);
 
@@ -351,19 +360,12 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
     function _applyFinalTwap(bytes32 conditionId, DataTypes.TwapData memory twapData, bool twapRequired) internal {
         if (twapData.marketEndedAt == 0) revert TwapTimestampInvalid(0, 0, 0);
         MarketState storage market = _getTwapOracleStorage().markets[conditionId];
-        // Early return if no time has passed (e.g. market just auto-initialized in this tx)
-        uint256 timeDelta = block.timestamp - market.lastTwapUpdate;
-        if (timeDelta == 0) return;
 
         //Only validate twap data if twap is required for the market, just like the regular twap updates.
         //Otherwise, front-running can prevent finalizations
         if (twapRequired) TwapMath._validateTwapData(twapData, market.lastTwapUpdate);
 
         // Market is being finalized
-        // Apply twap from lastTwapUpdate to marketEndedAt
-        if (twapData.marketEndedAt <= market.lastTwapUpdate) {
-            revert TwapTimestampInvalid(market.lastTwapUpdate, twapData.marketEndedAt, market.lastTwapUpdate + 1);
-        }
         if (twapData.marketEndedAt > block.timestamp) {
             revert TwapTimestampInvalid(market.lastTwapUpdate, twapData.marketEndedAt, block.timestamp);
         }
@@ -371,24 +373,28 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
             revert TwapPriceOutOfRange(twapData.marketEndYesPrice);
         }
 
+        // In non twap-required markets, anyone can advance lastTwapUpdate permissionlessly
+        // even further than the correct twapData.marketEndedAt if there is a gap until the backend finalizes the market
+        // In such a case, we apply marketEndYesPrice only after lastTwapUpdate
+        uint256 effectiveEnd = twapData.marketEndedAt > market.lastTwapUpdate ? twapData.marketEndedAt : market.lastTwapUpdate;
+
         //On non-twap required markets, we apply the default price for the rest of the market time.
         uint256 twapPriceYes = twapRequired ? twapData.twapPriceYes : TwapMath.defaultPrice();
 
-        uint256 timeToEnd = twapData.marketEndedAt - market.lastTwapUpdate;
+        uint256 timeToEnd = effectiveEnd - market.lastTwapUpdate;
         uint256 twapAccumulatorYesDelta = twapPriceYes * timeToEnd;
 
         //don't accumulate the final price, it will be applied only on read
-
         uint256 newTwapAccumulatorYes = market.twapAccumulatorYes + twapAccumulatorYesDelta;
         market.twapAccumulatorYes = uint128(newTwapAccumulatorYes);
-        market.lastTwapUpdate = uint40(block.timestamp);
+        market.lastTwapUpdate = uint40(effectiveEnd);
 
         // Store finalization info
-        market.marketEndedAt = uint40(twapData.marketEndedAt);
+        market.marketEndedAt = uint40(effectiveEnd);
         market.marketEndYesPrice = uint64(twapData.marketEndYesPrice);
 
         emit TwapUpdated(conditionId, newTwapAccumulatorYes, block.timestamp);
-        emit MarketFinalized(conditionId, twapData.marketEndedAt, twapData.marketEndYesPrice);
+        emit MarketFinalized(conditionId, effectiveEnd, twapData.marketEndYesPrice);
     }
 
     /// @notice Apply default 50:50 Twap update (when Twap not required)

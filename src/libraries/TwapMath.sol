@@ -38,7 +38,7 @@ library TwapMath {
         returns (uint256 yesYield, uint256 noYield)
     {
         // Handle edge cases
-        if (timeDelta == 0) return splitYieldEqual(totalYield);
+        if (timeDelta == 0) return splitYieldEqual(totalYield); //Can't happen anymore since we are using lastTwapPriceYes now
         if (totalYield == 0) return (0, 0);
         if (assetsYes == 0 && assetsNo == 0) return splitYieldEqual(totalYield);
         if (assetsYes == 0) return (0, totalYield);

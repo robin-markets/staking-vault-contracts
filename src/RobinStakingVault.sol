@@ -6,6 +6,8 @@ import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { AccessControlUpgradeable } from '@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol';
 import { ERC1155Upgradeable } from '@openzeppelin/contracts-upgradeable/token/ERC1155/ERC1155Upgradeable.sol';
 import { ERC1155Holder } from '@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol';
+import { IERC20 } from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import { SafeERC20 } from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 
 import { DataTypes } from './types/DataTypes.sol';
 import { AccountingMixin } from './mixins/AccountingMixin.sol';
@@ -14,7 +16,9 @@ import { YieldStrategyMixin } from './mixins/YieldStrategyMixin.sol';
 import { SignaturesMixin } from './mixins/SignaturesMixin.sol';
 import { PausableMixin } from './mixins/PausableMixin.sol';
 import { StorageLib } from './libraries/StorageLib.sol';
-import { DEFAULT_MANAGER_ROLE, FEE_HARVESTER_ROLE, TIMELOCKED_ROLE, PAUSER_ROLE, EXTERNAL_VAULT_MANAGER_ROLE } from './types/Roles.sol';
+import { ICollateralOnramp } from './interfaces/external/ICollateralOnramp.sol';
+import { IRobinStakingVault } from './interfaces/IRobinStakingVault.sol';
+import { DEFAULT_MANAGER_ROLE, FEE_HARVESTER_ROLE, TIMELOCKED_ROLE, PAUSER_ROLE, OPERATOR_ROLE } from './types/Roles.sol';
 
 /// @title RobinStakingVault
 /// @notice Singleton vault for Polymarket staking with multi-market support
@@ -55,7 +59,7 @@ contract RobinStakingVault is
         _grantRole(DEFAULT_MANAGER_ROLE, params.owner);
         _grantRole(FEE_HARVESTER_ROLE, params.owner);
         _grantRole(PAUSER_ROLE, params.owner);
-        _grantRole(EXTERNAL_VAULT_MANAGER_ROLE, params.owner);
+        _grantRole(OPERATOR_ROLE, params.owner);
         // Setup Timelock
         _grantRole(TIMELOCKED_ROLE, params.timelockController);
 
@@ -77,40 +81,68 @@ contract RobinStakingVault is
 
     // ============ Deposits ============
 
-    function deposit(bytes32 conditionId, uint256 yesAmount, uint256 noAmount, uint256 referralCode) external nonReentrant whenDepositsNotPaused {
-        (bytes32[] memory cids, uint256[] memory yams, uint256[] memory nams, uint256 nonZero) = _getActionParams(conditionId, yesAmount, noAmount);
-        _batchDeposit(cids, yams, nams, nonZero, referralCode);
-    }
-
     function batchDeposit(
         bytes32[] calldata conditionIds,
+        bytes32[] calldata questionIds,
         uint256[] calldata yesAmounts,
         uint256[] calldata noAmounts,
         uint256 nonZeroLength,
         uint256 referralCode
     ) external nonReentrant whenDepositsNotPaused {
-        _batchDeposit(conditionIds, yesAmounts, noAmounts, nonZeroLength, referralCode);
+        _batchDepositCore(msg.sender, bytes32(0), conditionIds, questionIds, yesAmounts, noAmounts, nonZeroLength, referralCode, false);
     }
 
-    /// @notice Internal batch deposit logic shared by single and batch deposit entry points
-    /// @dev Mints shares, transfers outcome tokens from user, pairs tokens, and supplies USDC to vaults
-    /// @param conditionIds Array of market condition IDs
-    /// @param yesAmounts Array of YES token amounts to deposit per market
-    /// @param noAmounts Array of NO token amounts to deposit per market
-    /// @param nonZeroLength Total count of non-zero amounts for batch transfer array sizing
-    /// @param referralCode Referral code for off-chain tracking (0 = no referral)
-    function _batchDeposit(
+    /// @notice Push-deposit entry, invoked from `onERC1155BatchReceived` for any unbracketed CTF
+    ///         transfer to the vault.
+    /// @dev SDK contract: the wallet calls
+    ///      `ctf.safeBatchTransferFrom(wallet, vault, ids, values, data)` where
+    ///      `data = abi.encode(bytes32[] conditionIds, bytes32[] questionIds, uint256[] yesAmounts,
+    ///      uint256[] noAmounts, uint256 nonZeroLength, uint256 referralCode)`. The transferred
+    ///      `(ids, values)` must match what `(conditionIds, yes/noAmounts, cached positionIds)`
+    ///      would build — YES then NO per market, markets in ascending `conditionId` order, zero
+    ///      amounts skipped. Mismatch (or any decode failure) reverts and undoes the CTF transfer.
+    /// @dev Guarded by `nonReentrant` so the deposit pipeline can't be entered concurrently with
+    ///      any other vault entry point (matters because the pipeline does multiple external calls
+    ///      — CTF.mergePositions, Yearn deposit, etc.). Guarded by `whenDepositsNotPaused` so push
+    ///      deposits can't sneak past a global deposit pause. The hook reverting here reverts the
+    ///      whole CTF transfer atomically — tokens stay with the caller.
+    function _runPushDeposit(
+        address depositor,
+        bytes32 receivedHash,
         bytes32[] memory conditionIds,
+        bytes32[] memory questionIds,
         uint256[] memory yesAmounts,
         uint256[] memory noAmounts,
         uint256 nonZeroLength,
         uint256 referralCode
+    ) internal override nonReentrant whenDepositsNotPaused {
+        _batchDepositCore(depositor, receivedHash, conditionIds, questionIds, yesAmounts, noAmounts, nonZeroLength, referralCode, true);
+    }
+
+    /// @notice Core batch deposit logic shared by the pull path and the push path
+    /// @dev Mints shares, acquires outcome tokens (pull or verify-already-pushed), pairs and merges,
+    ///      and supplies USDC to external vaults. `conditionIds` MUST be sorted strictly ascending.
+    /// @param receivedHash When `tokensPrePushed`, must equal `keccak256(abi.encode(ids, values))`
+    ///        of the tokens actually delivered to the vault — the hook computes this from its own
+    ///        `(ids, values)` arguments and passes it through
+    /// @param tokensPrePushed When `true`, validates `receivedHash` matches what the declared
+    ///        params imply. When `false`, pulls tokens via `_takeOutcomeTokens`.
+    function _batchDepositCore(
+        address depositor,
+        bytes32 receivedHash,
+        bytes32[] memory conditionIds,
+        bytes32[] memory questionIds,
+        uint256[] memory yesAmounts,
+        uint256[] memory noAmounts,
+        uint256 nonZeroLength,
+        uint256 referralCode,
+        bool tokensPrePushed
     ) internal {
         DataTypes.BatchDepositVars memory vars;
 
         vars.len = conditionIds.length;
         if (vars.len == 0) revert ZeroAmount();
-        if (yesAmounts.length != vars.len || noAmounts.length != vars.len) revert LengthMismatch();
+        if (yesAmounts.length != vars.len || noAmounts.length != vars.len || questionIds.length != vars.len) revert LengthMismatch();
         if (nonZeroLength < vars.len) revert LengthMismatch(); //for each conditionId, either A or B has to be non-zero
 
         // Sync pool assets with actual vault value once before processing markets
@@ -125,11 +157,13 @@ contract RobinStakingVault is
         // Process each market
         vars.nonZeroIndex = 0;
         for (uint256 i = 0; i < vars.len; i++) {
+            if (i > 0 && conditionIds[i] <= conditionIds[i - 1]) revert UnsortedConditionIds();
             uint256 yesAmount = yesAmounts[i];
             uint256 noAmount = noAmounts[i];
             if (yesAmount == 0 && noAmount == 0) revert ZeroAmount();
 
-            (vars.yesShares[i], vars.noShares[i]) = _prepareDepositMintShares(conditionIds[i], yesAmount, noAmount);
+            (vars.yesShares[i], vars.noShares[i]) =
+                _prepareDepositMintShares(depositor, conditionIds[i], questionIds[i], yesAmount, noAmount, tokensPrePushed);
 
             DataTypes.PolymarketTokenInfo memory info = getPolymarketTokenInfo(conditionIds[i]);
             if (yesAmount > 0) {
@@ -143,9 +177,15 @@ contract RobinStakingVault is
                 vars.nonZeroIndex++;
             }
         }
+        if (vars.nonZeroIndex != nonZeroLength) revert LengthMismatch();
 
-        // Batch transfer all tokens from user
-        _takeOutcomeTokens(vars.ids, vars.amts, msg.sender);
+        // Acquire the outcome tokens. Either pull from the user or verify the push transfer
+        // that triggered this call delivered exactly the (ids, amts) by comparing the hashes
+        if (tokensPrePushed) {
+            if (keccak256(abi.encode(vars.ids, vars.amts)) != receivedHash) revert PushDepositMismatch();
+        } else {
+            _takeOutcomeTokens(vars.ids, vars.amts, depositor);
+        }
 
         // Pair and supply for all markets
         for (uint256 i = 0; i < vars.len; i++) {
@@ -163,10 +203,13 @@ contract RobinStakingVault is
         // 2. External capacity (in _supplyToVaults): checks if the ACTUALLY paired USDC can fit in
         //    external vaults right now. This can fail if external vaults are full.
         // We separate these because external vault limits can change without this contract's knowledge.
-        uint256 maximumAdditional = getMaximumAdditionalMatchedTokens();
-        uint256 internalCapacity = _getTotalAvailableInternalCapacity();
-        if (maximumAdditional > internalCapacity) {
-            revert CapacityExceeded(maximumAdditional, internalCapacity);
+        // The internal check can be disabled by an admin (see `setInternalCapacityCheckDisabled`);
+        if (!_isInternalCapacityCheckDisabled()) {
+            uint256 maximumAdditional = getMaximumAdditionalMatchedTokens();
+            uint256 internalCapacity = _getTotalAvailableInternalCapacity();
+            if (maximumAdditional > internalCapacity) {
+                revert CapacityExceeded(maximumAdditional, internalCapacity);
+            }
         }
 
         // Supply all paired Usdc to vaults
@@ -174,19 +217,10 @@ contract RobinStakingVault is
             _supplyToVaults();
         }
 
-        emit Deposited(msg.sender, referralCode, conditionIds, yesAmounts, noAmounts, vars.yesShares, vars.noShares);
+        emit Deposited(depositor, referralCode, conditionIds, yesAmounts, noAmounts, vars.yesShares, vars.noShares);
     }
 
     // ============ Withdrawals ============
-
-    function withdraw(bytes32 conditionId, uint256 yesShares, uint256 noShares, address yieldRecipient, uint256 referralCode)
-        external
-        nonReentrant
-        whenWithdrawalsNotPaused
-    {
-        (bytes32[] memory cids, uint256[] memory yams, uint256[] memory nams, uint256 nonZero) = _getActionParams(conditionId, yesShares, noShares);
-        _batchWithdraw(msg.sender, cids, yams, nams, yieldRecipient, nonZero, referralCode);
-    }
 
     function batchWithdraw(
         bytes32[] calldata conditionIds,
@@ -194,20 +228,25 @@ contract RobinStakingVault is
         uint256[] calldata noShares,
         address yieldRecipient,
         uint256 nonZeroLength,
-        uint256 referralCode
+        uint256 referralCode,
+        bool wrapYieldToPolyUsd
     ) external nonReentrant whenWithdrawalsNotPaused {
-        _batchWithdraw(msg.sender, conditionIds, yesShares, noShares, yieldRecipient, nonZeroLength, referralCode);
+        _batchWithdraw(msg.sender, conditionIds, yesShares, noShares, yieldRecipient, nonZeroLength, referralCode, wrapYieldToPolyUsd);
     }
 
     /// @notice Internal batch withdrawal logic shared by single, batch, and signed withdrawal entry points
-    /// @dev Burns shares, splits USDC into outcome tokens if needed, transfers tokens to user, and pays out yield
+    /// @dev Burns shares, splits USDC into outcome tokens if needed, transfers tokens to user, and pays out yield.
+    ///      `conditionIds` MUST be sorted strictly ascending;
     /// @param user Address of the user withdrawing
-    /// @param conditionIds Array of market condition IDs
-    /// @param yesSharesArr Array of YES shares to burn per market
-    /// @param noSharesArr Array of NO shares to burn per market
+    /// @param conditionIds Array of market condition IDs, sorted strictly ascending
+    /// @param yesSharesArr Array of YES shares to burn per market (same order as conditionIds)
+    /// @param noSharesArr Array of NO shares to burn per market (same order as conditionIds)
     /// @param yieldRecipient Address to receive USDC yield (address(0) defaults to user)
     /// @param nonZeroLength Total count of non-zero share amounts for batch transfer array sizing
     /// @param referralCode Referral code for off-chain tracking (0 = no referral)
+    /// @param wrapYieldToPolyUsd If true, USDC.e yield is wrapped into PolyUSD before being sent to yieldRecipient.
+    ///        Reverts if the Polymarket onramp address has not been configured. If the onramp call itself
+    ///        fails (e.g. asset paused on Polymarket's side), falls back to a plain USDC.e transfer.
     /// @return yesAssets Array of YES outcome token amounts returned per market
     /// @return noAssets Array of NO outcome token amounts returned per market
     function _batchWithdraw(
@@ -217,7 +256,8 @@ contract RobinStakingVault is
         uint256[] memory noSharesArr,
         address yieldRecipient,
         uint256 nonZeroLength,
-        uint256 referralCode
+        uint256 referralCode,
+        bool wrapYieldToPolyUsd
     ) internal returns (uint256[] memory yesAssets, uint256[] memory noAssets) {
         DataTypes.BatchWithdrawVars memory vars;
 
@@ -236,6 +276,7 @@ contract RobinStakingVault is
         // This must happen first so we know the total USDC to withdraw from external vaults.
         // Pass 2 then splits USDC into outcome tokens and builds the transfer arrays.
         for (uint256 i = 0; i < vars.len; i++) {
+            if (i > 0 && conditionIds[i] <= conditionIds[i - 1]) revert UnsortedConditionIds();
             if (yesSharesArr[i] == 0 && noSharesArr[i] == 0) revert ZeroAmount();
             if (!isMarketInitialized(conditionIds[i])) revert MarketNotInitialized(conditionIds[i]);
 
@@ -245,7 +286,10 @@ contract RobinStakingVault is
             noAssets[i] = results[i].noAssets;
             vars.totalUsdcNeeded += results[i].totalNeeded;
             vars.totalYield += results[i].yieldNeeded;
+            if (yesSharesArr[i] > 0) vars.trueNonZeroLength++;
+            if (noSharesArr[i] > 0) vars.trueNonZeroLength++;
         }
+        if (nonZeroLength != vars.trueNonZeroLength) revert LengthMismatch();
 
         // Ensure we have enough Usdc (withdraws from vaults if needed, supplies excess idle after)
         // Must happen before _split which needs USDC to create outcome token pairs
@@ -281,7 +325,7 @@ contract RobinStakingVault is
         _giveOutcomeTokens(vars.ids, vars.amts, user);
 
         // Handle payout, including protocol fee
-        (uint256 yield, uint256 protocolFee) = _handleYieldPayout(user, yieldRecipient, vars.totalYield);
+        (uint256 yield, uint256 protocolFee) = _handleYieldPayout(user, yieldRecipient, vars.totalYield, wrapYieldToPolyUsd);
 
         emit Withdrawn(user, referralCode, conditionIds, yesSharesArr, noSharesArr, yesAssets, noAssets, yield, protocolFee);
     }
@@ -292,8 +336,11 @@ contract RobinStakingVault is
     /// Our backend then monitors the price and executes the withdrawal if the price is close to the limit. Then places the order.
     /// This will be handled differently (Our contract placing the order directly) Once Polymarket enables ERC-1271 signatures.
     function executeSignedWithdrawal(DataTypes.SignedWithdrawal calldata signedWithdrawal) external nonReentrant whenWithdrawalsNotPaused {
-        // Verify signature
-        _verifyAndConsumeSignedWithdrawal(signedWithdrawal);
+        // Verify signature via the extension (routes through fallback)
+        IRobinStakingVault(address(this)).verifySignedWithdrawal(signedWithdrawal);
+
+        // Consume the nonce in the vault
+        _consumeSignedWithdrawal(signedWithdrawal);
 
         // Execute withdrawal and check loss protection
         _executeSignedWithdrawalInternal(signedWithdrawal);
@@ -315,7 +362,7 @@ contract RobinStakingVault is
             _getActionParams(sw.conditionId, sw.yesShares, sw.noShares);
 
         (uint256[] memory yesAssets, uint256[] memory noAssets) =
-            _batchWithdraw(sw.user, cids, yams, nams, sw.yieldRecipient, nonZero, sw.referralCode);
+            _batchWithdraw(sw.user, cids, yams, nams, sw.yieldRecipient, nonZero, sw.referralCode, sw.wrapYieldToPolyUsd);
 
         // Check for loss protection: if tokenAssets < expected tokens, there was a loss
         if (sw.protectAgainstLoss && (yesAssets[0] < sw.minYesTokens || noAssets[0] < sw.minNoTokens)) {
@@ -323,18 +370,8 @@ contract RobinStakingVault is
         }
     }
 
-    function invalidateNonces(uint256[] calldata nonces) external {
-        _invalidateNonces(msg.sender, nonces);
-        emit NoncesInvalidated(msg.sender, nonces);
-    }
-
-    function invalidateNonceWord(uint256 wordPos) external {
-        _invalidateNonceWord(msg.sender, wordPos);
-        emit NonceWordInvalidated(msg.sender, wordPos);
-    }
-
-    function initializeMarket(bytes32 conditionId) public {
-        DataTypes.PolymarketTokenInfo memory info = _initializePolymarketInfo(conditionId);
+    function initializeMarket(bytes32 conditionId, bytes32 questionId) public {
+        DataTypes.PolymarketTokenInfo memory info = _initializePolymarketInfo(conditionId, questionId);
         _initializeMarket(conditionId, info.yesPositionId, info.noPositionId, info.negRisk);
     }
 
@@ -373,20 +410,52 @@ contract RobinStakingVault is
 
     // ============ Internal Helpers ============
 
-    /// @notice Deduct protocol fee from yield and transfer net yield to recipient
+    /// @notice Deduct protocol fee from yield and transfer net yield to recipient.
+    /// @dev If `wrapYieldToPolyUsd` is true, the user's yield is wrapped to PolyUSD via the
+    ///      Polymarket CollateralOnramp before transfer. If the onramp call itself reverts
+    ///      (asset paused or otherwise unavailable), the function falls back to a plain
+    ///      USDC.e transfer.
     /// @param user The withdrawing user (fallback recipient if recipient is address(0))
     /// @param recipient Address to receive yield (address(0) defaults to user)
     /// @param totalYield Total USDC yield before protocol fee deduction
-    /// @return yield Net yield transferred to recipient
+    /// @param wrapYieldToPolyUsd If true, attempt to wrap the net yield to PolyUSD
+    /// @return yield Net yield transferred to recipient (after protocol fee, in USDC.e units)
     /// @return protocolFee Protocol fee deducted and accumulated
-    function _handleYieldPayout(address user, address recipient, uint256 totalYield) internal returns (uint256 yield, uint256 protocolFee) {
+    function _handleYieldPayout(address user, address recipient, uint256 totalYield, bool wrapYieldToPolyUsd)
+        internal
+        returns (uint256 yield, uint256 protocolFee)
+    {
         address yieldRecipient = recipient == address(0) ? user : recipient;
         if (totalYield > 0) {
             protocolFee = (totalYield * getProtocolFeeBps()) / DataTypes.BPS_DENOM;
             _addProtocolFee(protocolFee);
             yield = totalYield - protocolFee; // User gets net yield
-            _transferUsdc(yieldRecipient, yield);
+            _payoutYield(yieldRecipient, yield, wrapYieldToPolyUsd);
         }
+    }
+
+    /// @notice Send `yield` USDC.e to `yieldRecipient`, wrapping to PolyUSD first if requested.
+    /// @dev On wrap failure (e.g. onramp paused), revokes the just-granted USDC.e allowance and
+    ///      falls back to a direct USDC.e transfer so the withdrawal still completes.
+    function _payoutYield(address yieldRecipient, uint256 yield, bool wrapYieldToPolyUsd) internal {
+        if (yield == 0) return;
+
+        if (wrapYieldToPolyUsd) {
+            address onramp = _getPolymarketOnramp();
+            if (onramp == address(0)) revert PolymarketOnrampNotSet();
+            address asset = getUnderlyingUsdc();
+
+            SafeERC20.forceApprove(IERC20(asset), onramp, yield);
+            try ICollateralOnramp(onramp).wrap(asset, yieldRecipient, yield) {
+                return;
+            } catch {
+                // Onramp unavailable (paused asset, upgraded contract, etc.). Revoke the
+                // outstanding allowance and fall back to a plain USDC.e transfer.
+                SafeERC20.forceApprove(IERC20(asset), onramp, 0);
+            }
+        }
+
+        _transferUsdc(yieldRecipient, yield);
     }
 
     /// @notice Wrap single-market parameters into arrays for batch processing
@@ -413,32 +482,45 @@ contract RobinStakingVault is
 
     /// @notice Prepare deposit mint shares for a single market
     /// @dev Used to hold common logic for deposit and batch deposit
+    /// @param depositor address to mint shares to
     /// @param conditionId Polymarket condition ID
     /// @param yesAmount Amount of YES outcome tokens to deposit
     /// @param noAmount Amount of NO outcome tokens to deposit
+    /// @param tokensPrePushed Whether or not the new tokens are already held by the vault or not
     /// @return yesShares Amount of YES shares minted
     /// @return noShares Amount of NO shares minted
-    function _prepareDepositMintShares(bytes32 conditionId, uint256 yesAmount, uint256 noAmount)
-        internal
-        returns (uint256 yesShares, uint256 noShares)
-    {
-        // Initialize market on first deposit
+    function _prepareDepositMintShares(
+        address depositor,
+        bytes32 conditionId,
+        bytes32 questionId,
+        uint256 yesAmount,
+        uint256 noAmount,
+        bool tokensPrePushed
+    ) internal returns (uint256 yesShares, uint256 noShares) {
+        // Initialize market on first deposit using the supplied questionId. For already-initialized
+        // markets the questionId is unused (cached classification wins).
         if (!isMarketInitialized(conditionId)) {
-            initializeMarket(conditionId);
+            initializeMarket(conditionId, questionId);
         }
 
-        // Update max potential (tokens not yet transferred, so current is OLD state)
-        (uint256 oldYes, uint256 oldNo) = getUnpairedTokens(conditionId);
-        _updateMaxPotential(oldYes, oldNo, oldYes + yesAmount, oldNo + noAmount);
+        // Update max potential
+        (uint256 currentYes, uint256 currentNo) = getUnpairedTokens(conditionId);
+        if (tokensPrePushed) {
+            // Push path: tokens already in balance, reconstruct pre-transfer state
+            _updateMaxPotential(currentYes - yesAmount, currentNo - noAmount, currentYes, currentNo);
+        } else {
+            // Pull path: tokens not yet here, current IS the old state
+            _updateMaxPotential(currentYes, currentNo, currentYes + yesAmount, currentNo + noAmount);
+        }
 
         // Update indexes first to get accurate share price (once for both sides)
         _updateYieldIndexes(conditionId);
-        // Mint shares to user
+        // Mint shares to depositor
         if (yesAmount > 0) {
-            yesShares = _mintShares(msg.sender, conditionId, DataTypes.Side.YES, yesAmount);
+            yesShares = _mintShares(depositor, conditionId, DataTypes.Side.YES, yesAmount);
         }
         if (noAmount > 0) {
-            noShares = _mintShares(msg.sender, conditionId, DataTypes.Side.NO, noAmount);
+            noShares = _mintShares(depositor, conditionId, DataTypes.Side.NO, noAmount);
         }
     }
 

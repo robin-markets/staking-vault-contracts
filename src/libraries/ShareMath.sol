@@ -57,26 +57,16 @@ library ShareMath {
     /// @notice Convert shares to assets using yield index
     /// @param shares Number of shares to convert
     /// @param yieldIndex Current yield index (scaled by INDEX_SCALE)
-    /// @param roundUp Whether to round up
     /// @return assets Amount of assets
-    function sharesToAssetsWithIndex(uint256 shares, uint256 yieldIndex, bool roundUp) internal pure returns (uint256 assets) {
-        if (roundUp) {
-            assets = shares.mulDiv(yieldIndex, DataTypes.INDEX_SCALE, Math.Rounding.Ceil);
-        } else {
-            assets = shares.mulDiv(yieldIndex, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
-        }
+    function sharesToAssetsWithIndex(uint256 shares, uint256 yieldIndex) internal pure returns (uint256 assets) {
+        assets = shares.mulDiv(yieldIndex, DataTypes.INDEX_SCALE, Math.Rounding.Floor);
     }
 
     /// @notice Convert assets to shares using yield index
     /// @param assets Amount of assets to convert
     /// @param yieldIndex Current yield index (scaled by INDEX_SCALE)
-    /// @param roundUp Whether to round up
     /// @return shares Number of shares
-    function assetsToSharesWithIndex(uint256 assets, uint256 yieldIndex, bool roundUp) internal pure returns (uint256 shares) {
-        if (roundUp) {
-            shares = assets.mulDiv(DataTypes.INDEX_SCALE, yieldIndex, Math.Rounding.Ceil);
-        } else {
-            shares = assets.mulDiv(DataTypes.INDEX_SCALE, yieldIndex, Math.Rounding.Floor);
-        }
+    function assetsToSharesWithIndex(uint256 assets, uint256 yieldIndex) internal pure returns (uint256 shares) {
+        shares = assets.mulDiv(DataTypes.INDEX_SCALE, yieldIndex, Math.Rounding.Floor);
     }
 }

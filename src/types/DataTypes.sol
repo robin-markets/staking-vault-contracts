@@ -73,9 +73,12 @@ library DataTypes {
         // Slot 8: TWAP checkpoint + yield reduction factor (2 × uint128 = 256 bits)
         uint128 lastYieldTwapCheckpointYes; // Checkpoint when yield was last distributed (twapAccumulatorNo is implicit)
         uint128 yieldReductionFactor; // Starts at INDEX_SCALE, only decreases on excess loss
-        // Slot 9: Timestamps (2 × uint40 = 80 bits, 176 bits unused)
+        // Slot 9: Timestamps + last implied price weighting (2 × uint40 + uint64 = 144 bits, 112 bits unused)
         uint40 marketInitTimestamp; // Timestamp of market initialization
         uint40 lastYieldTimestamp; // Timestamp of last yield index update
+        // Implied average YES price from the most recent  TWAP submission (i.e. when `lastTwapUpdate > lastYieldTimestamp`).
+        // Reused as the split weighting by `IndexCalcLib` whenever a subsequent yield update fires without a new TWAP submission
+        uint64 lastTwapPriceYes;
     }
 
     /// @notice Token metadata stored on market initialization
@@ -146,6 +149,7 @@ library DataTypes {
         uint256 nonce; // Replay protection per user
         uint256 expiry; // Expiration timestamp
         DataTypes.SignatureType signatureType; // Type of signature
+        bool wrapYieldToPolyUsd; // If true, USDC yield is wrapped to PolyUSD before being sent to yieldRecipient
         bytes signature; // EIP-712 signature
     }
 
@@ -156,7 +160,17 @@ library DataTypes {
         uint256 yesPositionId; // ERC-1155 ID for YES outcome
         uint256 noPositionId; // ERC-1155 ID for NO outcome
         bool negRisk; // True if WCOL-backed (NegRisk), false if Usdc-backed
-        address collateral; // Usdc or WCOL depending on negRisk
+        address collateral; // USDC.e, WCOL, or PolyUSD depending on classification at init time
+    }
+
+    /// @notice Admin-registered Polymarket oracle entry used by `_decideVaultMode`.
+    /// @dev Each entry pairs an oracle address (the CTF `prepareCondition` oracle, e.g. a UMA CTF
+    ///      adapter) with the collateral token that markets prepared by that oracle use. The
+    ///      collateral lets the vault decide whether split/merge should go through the on/off-ramp
+    ///      (PolyUSD-backed) or directly via the CTF with USDC.e.
+    struct PolymarketOracle {
+        address oracle;
+        address collateral;
     }
 
     // ============ Initialization Params ============
@@ -198,6 +212,7 @@ library DataTypes {
         uint256 totalUsdcNeeded;
         uint256 totalYield;
         uint256 nonZeroIndex;
+        uint256 trueNonZeroLength;
         uint256[] ids;
         uint256[] amts;
     }

@@ -98,7 +98,7 @@ interface IRobinTwapOracle {
         view
         returns (uint256 twapAccumulatorYes, uint256 twapAccumulatorNo, uint256 lastUpdate);
 
-    /// @notice Get current Twap accumulator for a market, extrapolated to the current time if possible
+    /// @notice Get the current TWAP accumulator for a market, extrapolated to the current time if market is finalized
     /// @param conditionId Market condition ID
     /// @return twapAccumulatorYes YES side Twap accumulator
     /// @return lastUpdate Last Twap update time
@@ -175,7 +175,7 @@ interface IRobinTwapOracle {
 
     // ============ Roles ============
 
-    /// @notice Role for managing TWAP configuration
+    /// @notice Multi-sig-only role for sensitive operations (TWAP signer rotation)
     /// forge-lint: disable-next-line(mixed-case-function)
     function DEFAULT_MANAGER_ROLE() external view returns (bytes32);
 
@@ -186,6 +186,14 @@ interface IRobinTwapOracle {
     /// @notice Role for the vault to initialize markets
     /// forge-lint: disable-next-line(mixed-case-function)
     function VAULT_ROLE() external view returns (bytes32);
+
+    /// @notice Fast operational role for TWAP-requirement toggles (per-market, default, global flags)
+    /// forge-lint: disable-next-line(mixed-case-function)
+    function OPERATOR_ROLE() external view returns (bytes32);
+
+    /// @notice Role for pausing the oracle (blocks TWAP submission); multi-sig-only in deployment
+    /// forge-lint: disable-next-line(mixed-case-function)
+    function PAUSER_ROLE() external view returns (bytes32);
 
     // ============ Constants ============
 

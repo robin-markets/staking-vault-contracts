@@ -61,6 +61,20 @@ interface IRobinLens {
             uint256[] memory noYield
         );
 
+    /// @notice Batch query user's shares + loss-adjusted assets across multiple markets
+    /// @dev Same as `batchGetUserPortfolio` but excludes the yield columns; cheaper to call when
+    ///      yield isn't needed and avoids the per-market `twapPricesYes` argument.
+    /// @param user User address
+    /// @param conditionIds Array of market condition IDs
+    /// @return yesShares Array of YES share balances
+    /// @return noShares Array of NO share balances
+    /// @return yesAssets Array of YES token values (loss-adjusted)
+    /// @return noAssets Array of NO token values (loss-adjusted)
+    function batchGetUserSharesAndAssets(address user, bytes32[] calldata conditionIds)
+        external
+        view
+        returns (uint256[] memory yesShares, uint256[] memory noShares, uint256[] memory yesAssets, uint256[] memory noAssets);
+
     /// @notice Batch preview deposits across multiple markets and sides
     /// @param conditionIds Array of market condition IDs
     /// @param sides Array of sides (YES or NO) per market

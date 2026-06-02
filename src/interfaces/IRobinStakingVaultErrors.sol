@@ -15,6 +15,9 @@ interface IRobinStakingVaultErrors {
     /// @notice Thrown when array lengths don't match
     error LengthMismatch();
 
+    /// @notice Thrown when batch conditionIds are not strictly increasing (must be sorted ascending, no duplicates)
+    error UnsortedConditionIds();
+
     /// @notice Thrown when conditionId is invalid (zero or unrecognized)
     error InvalidConditionId(bytes32 conditionId);
 
@@ -91,8 +94,21 @@ interface IRobinStakingVaultErrors {
     /// @notice Thrown when depositing into a side whose lossIndex has reached zero (total loss)
     error MarketSideBroken();
 
-    /// @notice Thrown when condition is not listed on any exchange
+    /// @notice Thrown when neither the negRisk adapter nor any configured Polymarket oracle
+    ///         hashes (with the supplied questionId) to the supplied conditionId.
     error UnlistedCondition(bytes32 conditionId);
+
+    /// @notice Thrown when a Polymarket oracle is added that is already in the list
+    error PolymarketOracleAlreadyExists(address oracle);
+
+    /// @notice Thrown when a Polymarket oracle is referenced but not in the list
+    error PolymarketOracleNotFound(address oracle);
+
+    /// @notice Thrown when a withdrawal opts into PolyUSD wrapping but the onramp address has not been set
+    error PolymarketOnrampNotSet();
+
+    /// @notice Thrown when a PolyUSD-backed market needs to unwrap on merge but the offramp address has not been set
+    error PolymarketOfframpNotSet();
 
     // ============ Polymarket Errors ============
 
@@ -134,4 +150,20 @@ interface IRobinStakingVaultErrors {
 
     /// @notice Thrown when there are no fees to harvest
     error NoFeesToHarvest();
+
+    // ============ Extension Errors ============
+
+    /// @notice Thrown when an address expected to be a contract has no code
+    error NotAContract(address provided);
+
+    // ============ Donation Block ============
+
+    /// @notice Thrown when an ERC-1155 transfer to the vault is attempted outside one of
+    ///         the bracketed CTF flows (`takeOutcomeTokens`, `split`). Blocks direct
+    ///         outcome-token donations and accidental returns of Robin shares.
+    error UnsolicitedTransfer();
+
+    /// @notice The deposit payload encoded in `safeBatchTransferFrom`'s `data` doesn't match the
+    ///         tokens actually delivered.
+    error PushDepositMismatch();
 }

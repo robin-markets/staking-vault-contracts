@@ -80,6 +80,17 @@ abstract contract YieldStrategyMixin is Initializable, IRobinStakingVaultEvents,
         return VaultLib.getTotalAvailableInternalCapacity(_getReservedUsdc());
     }
 
+    /// @notice Returns whether the forward-looking internal-capacity guard on deposits is disabled
+    function _isInternalCapacityCheckDisabled() internal view returns (bool) {
+        return _getYieldStrategyStorage().internalCapacityCheckDisabled;
+    }
+
+    /// @notice Toggle the forward-looking internal-capacity guard on `_batchDeposit`
+    function _setInternalCapacityCheckDisabled(bool disabled) internal {
+        _getYieldStrategyStorage().internalCapacityCheckDisabled = disabled;
+        emit InternalCapacityCheckDisabledUpdated(disabled);
+    }
+
     /// @notice Returns the available deposit capacity for a specific vault
     function _getAvailableCapacityByAddress(address vault) internal view virtual returns (uint256) {
         return VaultLib.getAvailableCapacityByAddress(vault);
@@ -94,7 +105,7 @@ abstract contract YieldStrategyMixin is Initializable, IRobinStakingVaultEvents,
 
     /// @notice Remove a vault (withdraws all, redistributes)
     function _removeVault(address vault) internal returns (uint256 withdrawn) {
-        return VaultLib.removeVault(vault, _getReservedUsdc());
+        return VaultLib.removeVault(vault);
     }
 
     /// @notice Update vault cap

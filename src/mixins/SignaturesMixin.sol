@@ -9,6 +9,7 @@ import { DataTypes } from '../types/DataTypes.sol';
 import { IRobinStakingVaultEvents } from '../interfaces/IRobinStakingVaultEvents.sol';
 import { IRobinStakingVaultErrors } from '../interfaces/IRobinStakingVaultErrors.sol';
 import { IPolyFactoryHelper } from '../interfaces/external/IPolyFactoryHelper.sol';
+import { ISafe } from '../interfaces/external/ISafe.sol';
 import { StorageLib } from '../libraries/StorageLib.sol';
 
 /// @title SignaturesMixin
@@ -19,7 +20,7 @@ abstract contract SignaturesMixin is Initializable, EIP712Upgradeable, IRobinSta
 
     /// @notice EIP-712 type hash for signed withdrawal structs
     bytes32 public constant SIGNED_WITHDRAWAL_TYPEHASH = keccak256(
-        'SignedWithdrawal(address signer,address user,uint256 referralCode,bytes32 conditionId,uint256 yesShares,uint256 noShares,uint256 minYesTokens,uint256 minNoTokens,address yieldRecipient,bool protectAgainstLoss,uint256 nonce,uint256 expiry,uint8 signatureType)'
+        'SignedWithdrawal(address signer,address user,uint256 referralCode,bytes32 conditionId,uint256 yesShares,uint256 noShares,uint256 minYesTokens,uint256 minNoTokens,address yieldRecipient,bool protectAgainstLoss,uint256 nonce,uint256 expiry,uint8 signatureType,bool wrapYieldToPolyUsd)'
     );
 
     uint256 private constant ONE_BIT = 1;
@@ -109,53 +110,24 @@ abstract contract SignaturesMixin is Initializable, EIP712Upgradeable, IRobinSta
     /// @notice Hash a signed withdrawal struct for EIP-712 signing
     function _hashSignedWithdrawal(DataTypes.SignedWithdrawal calldata withdrawal) internal pure returns (bytes32 hash) {
         bytes32 typeHash = SIGNED_WITHDRAWAL_TYPEHASH;
-        address signer = withdrawal.signer;
-        address user = withdrawal.user;
-        bytes32 conditionId = withdrawal.conditionId;
-        uint256 referralCode = withdrawal.referralCode;
-        uint256 yesShares = withdrawal.yesShares;
-        uint256 noShares = withdrawal.noShares;
-        uint256 minYesTokens = withdrawal.minYesTokens;
-        uint256 minNoTokens = withdrawal.minNoTokens;
-        address yieldRecipient = withdrawal.yieldRecipient;
-        bool protectAgainstLoss = withdrawal.protectAgainstLoss;
-        uint256 nonce = withdrawal.nonce;
-        uint256 expiry = withdrawal.expiry;
-        uint8 signatureType = uint8(withdrawal.signatureType);
-
         assembly {
             let ptr := mload(0x40)
             mstore(ptr, typeHash)
-            mstore(add(ptr, 0x20), signer)
-            mstore(add(ptr, 0x40), user)
-            mstore(add(ptr, 0x60), referralCode)
-            mstore(add(ptr, 0x80), conditionId)
-            mstore(add(ptr, 0xa0), yesShares)
-            mstore(add(ptr, 0xc0), noShares)
-            mstore(add(ptr, 0xe0), minYesTokens)
-            mstore(add(ptr, 0x100), minNoTokens)
-            mstore(add(ptr, 0x120), yieldRecipient)
-            mstore(add(ptr, 0x140), protectAgainstLoss)
-            mstore(add(ptr, 0x160), nonce)
-            mstore(add(ptr, 0x180), expiry)
-            mstore(add(ptr, 0x1a0), signatureType)
-            hash := keccak256(ptr, 0x1c0)
+            // Copy `signer` (offset 0x00) through `wrapYieldToPolyUsd` (offset 0x1a0): 14 × 32 bytes.
+            calldatacopy(add(ptr, 0x20), withdrawal, 0x1c0)
+            hash := keccak256(ptr, 0x1e0)
         }
     }
 
-    /// @notice Verify and consume a signed withdrawal
-    /// @param withdrawal Signed withdrawal data
-    /// @return True if valid, reverts otherwise
-    function _verifyAndConsumeSignedWithdrawal(DataTypes.SignedWithdrawal calldata withdrawal) internal returns (bool) {
-        StorageLib.SignaturesStorage storage $ = _getSignaturesStorage();
-
-        // Check expiry
+    /// @notice Validate a signed withdrawal: expiry, nonce not yet consumed, signature, and
+    ///         signer-for-user authorization. Read-only; reverts on any failure.
+    function _verifySignedWithdrawal(DataTypes.SignedWithdrawal calldata withdrawal) internal view {
         if (block.timestamp > withdrawal.expiry) {
             revert WithdrawalExpired(withdrawal.expiry, block.timestamp);
         }
 
-        // Check and consume nonce using bitmap
-        (bool isUsed, uint256 wordPos, uint256 bit) = _getNonceInformation(withdrawal.user, withdrawal.nonce);
+        //Check nonce using bitmap
+        (bool isUsed,,) = _getNonceInformation(withdrawal.user, withdrawal.nonce);
         if (isUsed) {
             revert WithdrawalNonceUsed(withdrawal.user, withdrawal.nonce);
         }
@@ -168,15 +140,20 @@ abstract contract SignaturesMixin is Initializable, EIP712Upgradeable, IRobinSta
         if (signer != withdrawal.signer || !_verifySignerForUser(withdrawal.signer, withdrawal.user, withdrawal.signatureType)) {
             revert InvalidWithdrawalSignature();
         }
+    }
 
-        // Consume nonce by setting the bit
-        $.nonceBitmap[withdrawal.user][wordPos] |= bit;
-
-        return true;
+    /// @notice Mark a signed withdrawal's nonce as consumed.
+    /// @dev Must only be called after `_verifySignedWithdrawal` has succeeded for this withdrawal
+    ///      in the same transaction
+    function _consumeSignedWithdrawal(DataTypes.SignedWithdrawal calldata withdrawal) internal {
+        (uint256 wordPos, uint256 bit) = _splitNonce(withdrawal.nonce);
+        _getSignaturesStorage().nonceBitmap[withdrawal.user][wordPos] |= bit;
     }
 
     /// @notice Verify that a signer is authorized to act on behalf of a user
-    /// @dev Supports EOA (direct match), Polymarket proxy wallets, and Polymarket Gnosis safes
+    /// @dev Supports EOA (direct match), Polymarket proxy wallets, and Polymarket Gnosis safes.
+    ///      For Safes we additionally require the Safe to still be 1-of-1 with `signer` as a
+    ///      current owner — locks out rotated/leaked deploy-time keys and multi-sig Safes
     /// @param signer The address that produced the signature
     /// @param user The address of the wallet being acted upon
     /// @param signatureType The type of signer-to-user relationship
@@ -188,7 +165,8 @@ abstract contract SignaturesMixin is Initializable, EIP712Upgradeable, IRobinSta
         } else if (signatureType == DataTypes.SignatureType.POLY_PROXY) {
             return user == $.polymarketFactoryHelper.getPolyProxyWalletAddress(signer);
         } else if (signatureType == DataTypes.SignatureType.POLY_GNOSIS_SAFE) {
-            return user == $.polymarketFactoryHelper.getSafeAddress(signer);
+            if (user.code.length == 0) return false;
+            return ISafe(user).getThreshold() == 1 && ISafe(user).isOwner(signer);
         }
         return false;
     }

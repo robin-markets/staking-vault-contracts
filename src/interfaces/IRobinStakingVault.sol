@@ -29,33 +29,22 @@ interface IRobinStakingVault is
     /// @param params Initialization parameters struct
     function initialize(DataTypes.InitParams calldata params) external;
 
-    // ============ User Functions - Single Market ============
-
-    /// @notice Deposit outcome tokens to a single market
-    /// @param conditionId Polymarket condition ID
-    /// @param yesAmount Amount of YES outcome tokens to deposit
-    /// @param noAmount Amount of NO outcome tokens to deposit
-    /// @param referralCode Referral code for off-chain tracking (0 = no referral)
-    function deposit(bytes32 conditionId, uint256 yesAmount, uint256 noAmount, uint256 referralCode) external;
-
-    /// @notice Withdraw outcome tokens from a single market
-    /// @param conditionId Polymarket condition ID
-    /// @param yesShares YES shares to burn (0 if none)
-    /// @param noShares NO shares to burn (0 if none)
-    /// @param yieldRecipient Address to receive the yield; If address(0), the yield will be sent to msg.sender
-    /// @param referralCode Referral code for off-chain tracking (0 = no referral)
-    function withdraw(bytes32 conditionId, uint256 yesShares, uint256 noShares, address yieldRecipient, uint256 referralCode) external;
-
     // ============ User Functions - Batch ============
 
     /// @notice Batch deposit to multiple markets
-    /// @param conditionIds Array of condition IDs
-    /// @param yesAmounts Array of YES amounts per market
-    /// @param noAmounts Array of NO amounts per market
+    /// @dev `conditionIds` MUST be sorted strictly ascending (no duplicates). Reverts with
+    ///      `UnsortedConditionIds` otherwise. Sort off-chain and apply the same permutation
+    ///      to `questionIds`, `yesAmounts`, and `noAmounts`.
+    ///      For markets that are already initialized, the supplied `questionIds[i]` is unused.
+    /// @param conditionIds Array of condition IDs, sorted strictly ascending
+    /// @param questionIds Array of Polymarket questionIds (same order as conditionIds; used only for auto-init)
+    /// @param yesAmounts Array of YES amounts per market (same order as conditionIds)
+    /// @param noAmounts Array of NO amounts per market (same order as conditionIds)
     /// @param nonZeroLength Length of non-zero amounts in yesAmounts and noAmounts arrays. Needed to decide the length of the arrays for the batch transfer. (better calculate offchain)
     /// @param referralCode Referral code for off-chain tracking (0 = no referral)
     function batchDeposit(
         bytes32[] calldata conditionIds,
+        bytes32[] calldata questionIds,
         uint256[] calldata yesAmounts,
         uint256[] calldata noAmounts,
         uint256 nonZeroLength,
@@ -63,19 +52,26 @@ interface IRobinStakingVault is
     ) external;
 
     /// @notice Batch withdraw from multiple markets
-    /// @param conditionIds Array of condition IDs
-    /// @param yesShares Array of YES shares to burn per market
-    /// @param noShares Array of NO shares to burn per market
+    /// @dev `conditionIds` MUST be sorted strictly ascending (no duplicates). Reverts with
+    ///      `UnsortedConditionIds` otherwise. Sort off-chain and apply the same permutation
+    ///      to `yesShares` and `noShares`.
+    /// @param conditionIds Array of condition IDs, sorted strictly ascending
+    /// @param yesShares Array of YES shares to burn per market (same order as conditionIds)
+    /// @param noShares Array of NO shares to burn per market (same order as conditionIds)
     /// @param yieldRecipient Address to receive the yield; If address(0), the yield will be sent to msg.sender
     /// @param nonZeroLength Length of non-zero amounts in yesShares and noShares arrays. Needed to decide the length of the arrays for the batch transfer. (better calculate offchain)
     /// @param referralCode Referral code for off-chain tracking (0 = no referral)
+    /// @param wrapYieldToPolyUsd If true, wrap the USDC.e yield to PolyUSD via Polymarket's CollateralOnramp
+    ///        before transferring to `yieldRecipient`. If the onramp call itself reverts (asset paused, etc.), the call falls back
+    ///        to a plain USDC.e transfer.
     function batchWithdraw(
         bytes32[] calldata conditionIds,
         uint256[] calldata yesShares,
         uint256[] calldata noShares,
         address yieldRecipient,
         uint256 nonZeroLength,
-        uint256 referralCode
+        uint256 referralCode,
+        bool wrapYieldToPolyUsd
     ) external;
 
     // ============ User Functions - Signed Withdrawal ============
@@ -84,19 +80,30 @@ interface IRobinStakingVault is
     /// @param signedWithdrawal Signed withdrawal data
     function executeSignedWithdrawal(DataTypes.SignedWithdrawal calldata signedWithdrawal) external;
 
-    /// @notice Invalidate specific nonces to cancel signed withdrawals
-    /// @param nonces Array of nonces to invalidate
-    function invalidateNonces(uint256[] calldata nonces) external;
+    /// @notice Validate a signed withdrawal (expiry + nonce + signature + signer authorization).
+    ///         Reverts on any failure.
+    function verifySignedWithdrawal(DataTypes.SignedWithdrawal calldata signedWithdrawal) external view;
 
-    /// @notice Invalidate all nonces in a word (cancel up to 256 orders at once)
+    /// @notice Invalidate specific nonces to cancel signed withdrawals. An EOA can invalidate nonces for Polymarket proxy wallets or Safes.
+    /// @param user the user for which the nonces should be invalidated
+    /// @param signatureType how the user address relates to msg.sender
+    /// @param nonces Array of nonces to invalidate
+    function invalidateNonces(address user, DataTypes.SignatureType signatureType, uint256[] calldata nonces) external;
+
+    /// @notice Invalidate all nonces in a word (cancel up to 256 orders at once). An EOA can invalidate nonces for Polymarket proxy wallets or Safes.
+    /// @param user the user for which the nonces should be invalidated
+    /// @param signatureType how the user address relates to msg.sender
     /// @param wordPos The word position to invalidate (invalidates nonces wordPos*256 to wordPos*256+255)
-    function invalidateNonceWord(uint256 wordPos) external;
+    function invalidateNonceWord(address user, DataTypes.SignatureType signatureType, uint256 wordPos) external;
 
     // ============ Market Initialization ============
 
     /// @notice Initialize a market; Typically called by the backend right before a user transaction to save gas for the user
+    /// @dev Markets MUST be initialized via this function before their first deposit (auto-init was removed).
     /// @param conditionId Market condition ID
-    function initializeMarket(bytes32 conditionId) external;
+    /// @param questionId Polymarket questionId — used to verify negRisk vs regular classification by
+    ///        reconstructing the canonical conditionId locally as `keccak256(oracle, questionId, 2)`.
+    function initializeMarket(bytes32 conditionId, bytes32 questionId) external;
 
     // ============ Admin Functions - Vault Management ============
 
@@ -125,8 +132,8 @@ interface IRobinStakingVault is
     function swapVaultOrder(address vault1, address vault2) external;
 
     /// @notice Manually supply idle Usdc to vaults
-    /// @return supplied Amount that was successfully supplied to vaults
-    function supplyIdleToVaults() external returns (uint256 supplied);
+    /// @return remaining Amount that is remaining idle in the vault
+    function supplyIdleToVaults() external returns (uint256 remaining);
 
     // ============ Admin Functions - Protocol Fees ============
 
@@ -141,12 +148,36 @@ interface IRobinStakingVault is
     // ============ Admin Functions - Twap ============
 
     /// @notice Update Twap grace period
-    /// @param gracePeriod New grace period in seconds (max 120 seconds)
+    /// @param gracePeriod New grace period in seconds (max 240 seconds)
     function setTwapGracePeriod(uint256 gracePeriod) external;
 
-    /// @notice Set the Twap Oracle
-    /// @param twapOracle Address of the Twap Oracle
-    function setTwapOracle(address twapOracle) external;
+    // ============ Admin Functions - Polymarket Oracle List ============
+
+    /// @notice Append a Polymarket oracle / collateral pair to the recognition list (used by `_decideVaultMode`).
+    /// @dev `collateral` is the token markets prepared by this oracle use on the CTF (USDC.e or PolyUSD).
+    function addPolymarketOracle(address oracle, address collateral) external;
+
+    /// @notice Remove a Polymarket oracle from the recognition list
+    function removePolymarketOracle(address oracle) external;
+
+    /// @notice Swap the priority of two Polymarket oracles (front of list checked first)
+    function swapPolymarketOracleOrder(address oracle1, address oracle2) external;
+
+    /// @notice Get the ordered list of Polymarket oracle / collateral pairs
+    /// @return Ordered list (front-of-list is checked first by `_decideVaultMode`)
+    function getPolymarketOracles() external view returns (DataTypes.PolymarketOracle[] memory);
+
+    /// @notice Update the Polymarket CollateralOnramp address (used to wrap USDC.e to PolyUSD).
+    function setPolymarketOnramp(address newOnramp) external;
+
+    /// @notice Get the configured Polymarket CollateralOnramp address (zero if unset)
+    function getPolymarketOnramp() external view returns (address);
+
+    /// @notice Update the Polymarket CollateralOfframp address (used to unwrap PolyUSD to USDC.e).
+    function setPolymarketOfframp(address newOfframp) external;
+
+    /// @notice Get the configured Polymarket CollateralOfframp address (zero if unset)
+    function getPolymarketOfframp() external view returns (address);
 
     // ============ Admin Functions - Emergency ============
 
@@ -167,6 +198,12 @@ interface IRobinStakingVault is
     /// @notice Disable emergency mode for a specific vault
     /// @param vault Address of the vault to disable emergency mode for
     function disableVaultEmergency(address vault) external;
+
+    /// @notice Toggle the forward-looking internal-capacity guard on `_batchDeposit`
+    function setInternalCapacityCheckDisabled(bool disabled) external;
+
+    /// @notice Read whether the forward-looking internal-capacity guard is disabled
+    function isInternalCapacityCheckDisabled() external view returns (bool);
 
     // ============ Admin Functions - Pause ============
 
@@ -216,7 +253,7 @@ interface IRobinStakingVault is
     /// forge-lint: disable-next-line(mixed-case-function)
     function PAUSER_ROLE() external view returns (bytes32);
 
-    /// @notice Role for managing external ERC-4626 yield vaults and emergency controls
+    /// @notice Role for fast operational actions (emergency mode, TWAP requirements, capacity toggle)
     /// forge-lint: disable-next-line(mixed-case-function)
-    function EXTERNAL_VAULT_MANAGER_ROLE() external view returns (bytes32);
+    function OPERATOR_ROLE() external view returns (bytes32);
 }
