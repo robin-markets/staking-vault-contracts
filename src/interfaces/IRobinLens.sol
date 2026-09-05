@@ -118,17 +118,67 @@ interface IRobinLens {
         view
         returns (DataTypes.IndexResult[] memory results);
 
-    // ============ Capacity Check ============
+    // ============ Capacity ============
 
-    /// @notice Check if a batch deposit would succeed or fail due to capacity limits
+    /// @notice Vault-wide deposit headroom, evaluated exactly as a real deposit would be
+    /// @dev All fields use `type(uint256).max` to mean "uncapped". The internal tier is admin-disableable
+    ///      (`isInternalCapacityCheckDisabled`); when disabled it never blocks a deposit, so
+    ///      `internalRemaining` reports uncapped and drops out of `remainingUsdc`.
+    struct VaultCapacity {
+        /// @dev USDC the vault can still absorb now; min of the enforced tiers
+        uint256 remainingUsdc;
+        /// @dev Whether the internal (forward-looking worst-case pairing) guard is enforced
+        bool internalCheckEnabled;
+        /// @dev Headroom for additional worst-case matched tokens before the internal guard trips
+        uint256 internalRemaining;
+        /// @dev Live headroom the actually-paired USDC must fit into (external ERC-4626 vaults)
+        uint256 externalRemaining;
+    }
+
+    /// @notice Which side of a market pairs against the pool's current unmatched surplus
+    enum MatchingSide {
+        YES,
+        NO,
+        NONE
+    }
+
+    /// @notice Result of simulating a batch deposit: whether it fits, how far each tier overshoots,
+    ///         where each market's tokens land, plus the vault's headroom
+    struct DepositCapacity {
+        /// @dev Whether a deposit of the given batch would succeed (honors the internal-guard flag)
+        bool fits;
+        /// @dev USDC the batch overshoots the internal (unmatched-surplus) tier by; 0 when not binding
+        uint256 internalShortfall;
+        /// @dev USDC the batch overshoots the external (matched / ERC-4626) tier by; 0 when not binding
+        uint256 externalShortfall;
+        /// @dev Per market: USDC that pairs against the pool now; consumes external (matched) capacity
+        uint256[] matchedUsdc;
+        /// @dev Per market: USDC this deposit adds to the pool's unmatched surplus; consumes internal capacity (0 when it reduces the surplus)
+        uint256[] unmatchedUsdc;
+        /// @dev Per market: the side that pairs against the pool's current surplus (NONE when balanced)
+        MatchingSide[] matchingSide;
+        /// @dev The vault's current headroom; identical to `getCapacity()`
+        VaultCapacity capacity;
+    }
+
+    /// @notice The vault's current deposit headroom; no batch needed
+    /// @dev Reads the live state of every attached ERC-4626 vault (its own `maxDeposit` and the admin
+    ///      cap) plus the internal-guard flag. Use this for a "how full is the vault" gauge.
+    /// @return capacity Per-tier and overall remaining headroom
+    function getCapacity() external view returns (VaultCapacity memory capacity);
+
+    /// @notice Simulate a batch deposit: whether it fits, per-tier shortfalls, and where each market's tokens land
+    /// @dev Mirrors the vault's deposit-time checks, including skipping the internal tier when
+    ///      `isInternalCapacityCheckDisabled()` is set. Capacity is vault-wide, so pass the WHOLE
+    ///      prospective batch; per-market checks do not compose.
     /// @param conditionIds Array of condition IDs
-    /// @param yesAmounts Array of YES amounts
-    /// @param noAmounts Array of NO amounts
-    /// @return True if deposit would succeed, false if it would revert due to exceeded capacity
-    function checkBatchDepositCapacity(bytes32[] memory conditionIds, uint256[] memory yesAmounts, uint256[] memory noAmounts)
+    /// @param yesAmounts Array of YES amounts (aligned with conditionIds)
+    /// @param noAmounts Array of NO amounts (aligned with conditionIds)
+    /// @return result `fits`, the per-tier shortfalls, per-market matched/unmatched USDC, and the vault's headroom
+    function getDepositCapacity(bytes32[] memory conditionIds, uint256[] memory yesAmounts, uint256[] memory noAmounts)
         external
         view
-        returns (bool);
+        returns (DepositCapacity memory result);
 
     // ============ Vault Reference ============
 

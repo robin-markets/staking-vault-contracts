@@ -192,56 +192,114 @@ contract RobinLens is IRobinLens {
         }
     }
 
-    // ============ Capacity Check ============
+    // ============ Capacity ============
 
     /// @inheritdoc IRobinLens
-    function checkBatchDepositCapacity(bytes32[] memory conditionIds, uint256[] memory yesAmounts, uint256[] memory noAmounts)
-        public
+    function getCapacity() external view returns (VaultCapacity memory capacity) {
+        (capacity,,) = _capacity(IRobinStakingVault(vault));
+    }
+
+    /// @inheritdoc IRobinLens
+    function getDepositCapacity(bytes32[] memory conditionIds, uint256[] memory yesAmounts, uint256[] memory noAmounts)
+        external
         view
-        returns (bool)
+        returns (DepositCapacity memory result)
     {
-        if (conditionIds.length != yesAmounts.length || conditionIds.length != noAmounts.length) revert LengthMismatch();
+        uint256 len = conditionIds.length;
+        if (len != yesAmounts.length || len != noAmounts.length) revert LengthMismatch();
 
         IRobinStakingVault v = IRobinStakingVault(vault);
-        uint256 internalCapacity = v.getTotalAvailableInternalCapacity();
-        uint256 externalCapacity = v.getTotalAvailableCapacity();
-        uint256 newMaxPotential = v.getMaximumAdditionalMatchedTokens();
+        uint256 internalCapacity;
+        uint256 newMaxPotential;
+        (result.capacity, internalCapacity, newMaxPotential) = _capacity(v);
+        result.matchedUsdc = new uint256[](len);
+        result.unmatchedUsdc = new uint256[](len);
+        result.matchingSide = new MatchingSide[](len);
+
+        // ---- Simulate the batch (mirrors _addUnpaired + _pairAndMerge), one market at a time ----
         uint256 totalPairedUsdc;
-
-        for (uint256 i = 0; i < conditionIds.length; i++) {
+        for (uint256 i = 0; i < len; i++) {
             (uint256 unpairedYes, uint256 unpairedNo) = v.getUnpairedTokens(conditionIds[i]);
+            uint256 pairs;
+            (newMaxPotential, pairs, result.unmatchedUsdc[i], result.matchingSide[i]) =
+                _simulateMarket(unpairedYes, unpairedNo, yesAmounts[i], noAmounts[i], newMaxPotential);
+            result.matchedUsdc[i] = pairs;
+            totalPairedUsdc += pairs;
+        }
 
-            uint256 newYes = unpairedYes + yesAmounts[i];
-            uint256 newNo = unpairedNo + noAmounts[i];
-
-            // Update max potential (simulates _addUnpaired)
-            uint256 currentMax = Math.max(unpairedYes, unpairedNo);
-            uint256 newMax = Math.max(newYes, newNo);
-            if (newMax > currentMax) {
-                newMaxPotential += newMax - currentMax;
-            }
-
-            // Simulate pairing (simulates _pairAndMerge)
-            uint256 pairs = newYes < newNo ? newYes : newNo;
-            if (pairs > 0) {
-                uint256 maxAfterPair = Math.max(newYes - pairs, newNo - pairs);
-                uint256 reduction = newMax - maxAfterPair;
-                newMaxPotential = reduction <= newMaxPotential ? newMaxPotential - reduction : 0;
-                totalPairedUsdc += pairs;
+        // ---- Tier checks, gated exactly like the vault's batch-deposit path ----
+        // Internal (forward-looking): only enforced while the admin guard is on. The vault runs it after
+        // merging, when the batch's own paired USDC is still idle in the contract, so that USDC has
+        // already been subtracted from the internal capacity the vault compares against.
+        if (result.capacity.internalCheckEnabled && internalCapacity != type(uint256).max) {
+            uint256 internalAtCheck = internalCapacity > totalPairedUsdc ? internalCapacity - totalPairedUsdc : 0;
+            if (newMaxPotential > internalAtCheck) {
+                result.internalShortfall = newMaxPotential - internalAtCheck;
             }
         }
+        // External (live ERC-4626 headroom for the paired USDC): always enforced.
+        if (result.capacity.externalRemaining != type(uint256).max && totalPairedUsdc > result.capacity.externalRemaining) {
+            result.externalShortfall = totalPairedUsdc - result.capacity.externalRemaining;
+        }
+        result.fits = result.internalShortfall == 0 && result.externalShortfall == 0;
+    }
 
-        // Check internal capacity (potential max vs caps)
-        if (internalCapacity != type(uint256).max && newMaxPotential > internalCapacity) {
-            return false;
+    /// @dev One market's share of the simulation: advances the global max potential the way
+    ///      _addUnpaired + _pairAndMerge would, and reports where this deposit's tokens land.
+    function _simulateMarket(uint256 unpairedYes, uint256 unpairedNo, uint256 yesAmount, uint256 noAmount, uint256 maxPotential)
+        private
+        pure
+        returns (uint256 updatedMaxPotential, uint256 pairs, uint256 unmatchedAdded, MatchingSide side)
+    {
+        side = unpairedYes > unpairedNo ? MatchingSide.NO : unpairedNo > unpairedYes ? MatchingSide.YES : MatchingSide.NONE;
+
+        uint256 newYes = unpairedYes + yesAmount;
+        uint256 newNo = unpairedNo + noAmount;
+        uint256 currentMax = Math.max(unpairedYes, unpairedNo);
+        uint256 newMax = Math.max(newYes, newNo);
+
+        // Update max potential (simulates _addUnpaired)
+        updatedMaxPotential = maxPotential;
+        if (newMax > currentMax) {
+            updatedMaxPotential += newMax - currentMax;
         }
 
-        // Check external capacity (paired USDC vs vault limits)
-        if (externalCapacity != type(uint256).max && totalPairedUsdc > externalCapacity) {
-            return false;
+        // Simulate pairing (simulates _pairAndMerge)
+        pairs = newYes < newNo ? newYes : newNo;
+        uint256 maxAfterPair = newMax;
+        if (pairs > 0) {
+            maxAfterPair = Math.max(newYes - pairs, newNo - pairs);
+            updatedMaxPotential = (newMax - maxAfterPair) <= updatedMaxPotential ? updatedMaxPotential - (newMax - maxAfterPair) : 0;
         }
 
-        return true;
+        // Pairs consume the external (matched) tier. The internal tier charges the growth of the
+        // market's worst-case pairing exposure: every token on the side that is larger after the
+        // deposit, net of pool surplus it pairs against. Pairing doesn't reduce that charge; the
+        // merged USDC is idle at check time and fills the cap just the same.
+        unmatchedAdded = newMax - currentMax;
+    }
+
+    /// @dev Shared headroom read behind both public views. Also returns the raw internal cap and the
+    ///      current max potential the batch simulation compares against, so the vault is read once.
+    function _capacity(IRobinStakingVault v)
+        private
+        view
+        returns (VaultCapacity memory capacity, uint256 internalCapacity, uint256 currentMaxPotential)
+    {
+        internalCapacity = v.getTotalAvailableInternalCapacity();
+        currentMaxPotential = v.getMaximumAdditionalMatchedTokens();
+        capacity.internalCheckEnabled = !v.isInternalCapacityCheckDisabled();
+        // External: the live ERC-4626 headroom the vault getter already computes (min of each attached
+        // vault's own maxDeposit and the admin cap, minus idle USDC). Always enforced.
+        capacity.externalRemaining = v.getTotalAvailableCapacity();
+        // Internal: room left for additional worst-case matched tokens. A disabled guard never blocks,
+        // so it reports uncapped and drops out of the overall minimum.
+        if (!capacity.internalCheckEnabled || internalCapacity == type(uint256).max) {
+            capacity.internalRemaining = type(uint256).max;
+        } else {
+            capacity.internalRemaining = internalCapacity > currentMaxPotential ? internalCapacity - currentMaxPotential : 0;
+        }
+        capacity.remainingUsdc = Math.min(capacity.internalRemaining, capacity.externalRemaining);
     }
 
     // ============ Errors ============
