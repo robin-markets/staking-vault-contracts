@@ -89,7 +89,9 @@ library TwapMath {
             revert IRobinTwapOracle.TwapPriceOutOfRange(data.twapPriceYes);
         }
 
-        // NONCES are not needed for Twaps since replay attacks are not possible for the same timestamp
+        // NONCES are not needed for Twaps: exact replays are no-ops (endTimestamp <= lastTwapUpdate is
+        // skipped) and overlapping windows (startTimestamp < lastTwapUpdate) are never applied to the
+        // accumulator — see the alignment checks in RobinTwapOracle._applyTwap/_applyFinalTwap.
     }
 
     /// @notice Validate Twap data timing
@@ -105,7 +107,8 @@ library TwapMath {
     {
         // Start must not be after last update (no gaps allowed)
         // It can be before it though, which will happen often if two users interact with the same market at the same time.
-        // One user updates first and the second one can just submit the same twap data because applyTwap() only advances the accumulator since lastUpdate.
+        // Overlapping windows are not rejected here so racing batches don't revert, but the call sites
+        // must never apply an overlapping window's average price to the accumulator.
         if (startTimestamp > lastUpdate) return false;
         // End must not be in the future
         if (endTimestamp > currentTime) return false;

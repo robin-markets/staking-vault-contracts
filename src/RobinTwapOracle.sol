@@ -339,9 +339,18 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
         // this batch's endTimestamp). Checking <= here avoids an arithmetic underflow on
         // the subsequent subtraction and lets the rest of the batch proceed.
         if (twapData.endTimestamp <= market.lastTwapUpdate) return;
-        uint256 timeDelta = twapData.endTimestamp - market.lastTwapUpdate;
 
         TwapMath._validateTwapData(twapData, market.lastTwapUpdate);
+
+        // twapPriceYes is the average over the signed window [startTimestamp, endTimestamp], but the
+        // accumulator only advances over the suffix [lastTwapUpdate, endTimestamp]. When the window
+        // overlaps already-accumulated time (startTimestamp < lastTwapUpdate) the two intervals differ,
+        // so applying the whole-window average to the suffix would credit the wrong price.
+        // Skip such entries like stale ones: racing honest submissions still go through without
+        // reverting the batch, and the accumulator advances with the next aligned payload.
+        if (twapData.startTimestamp < market.lastTwapUpdate) return;
+
+        uint256 timeDelta = twapData.endTimestamp - market.lastTwapUpdate;
 
         // Accumulate: twapAccumulatorYes += twapPriceYes * timeDelta
         // This tracks cumulative (price * time) for YES side
@@ -363,7 +372,13 @@ contract RobinTwapOracle is Initializable, UUPSUpgradeable, AccessControlUpgrade
 
         //Only validate twap data if twap is required for the market, just like the regular twap updates.
         //Otherwise, front-running can prevent finalizations
-        if (twapRequired) TwapMath._validateTwapData(twapData, market.lastTwapUpdate);
+        if (twapRequired) {
+            TwapMath._validateTwapData(twapData, market.lastTwapUpdate);
+            // Same overlap issue as in _applyTwap.
+            // Every payload signed after resolution carries the finalization info,
+            // so the next aligned payload finalizes the market.
+            if (twapData.startTimestamp < market.lastTwapUpdate) return;
+        }
 
         // Market is being finalized
         if (twapData.marketEndedAt > block.timestamp) {
