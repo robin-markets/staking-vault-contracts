@@ -370,6 +370,24 @@ contract RobinStakingVault is
         }
     }
 
+    // ============ Operator Withdrawal ============
+
+    /// @notice Withdraw `user`'s shares on their behalf. Outcome tokens AND yield go to `user` only.
+    /// @dev Wind-down exit for accounts that can no longer call the vault themselves (Polymarket
+    ///      DepositWallets once the Polymarket relayer stops forwarding calls to non-Polymarket
+    ///      contracts). The operator chooses timing and amounts but can't redirect funds: the
+    ///      yield recipient is pinned to `user`. Same accounting as `batchWithdraw`, emits `Withdrawn`
+    ///      with `user` (referral code 0).
+    function operatorWithdraw(
+        address user,
+        bytes32[] calldata conditionIds,
+        uint256[] calldata yesShares,
+        uint256[] calldata noShares,
+        uint256 nonZeroLength
+    ) external onlyRole(OPERATOR_ROLE) nonReentrant whenWithdrawalsNotPaused {
+        _batchWithdraw(user, conditionIds, yesShares, noShares, user, nonZeroLength, 0, true);
+    }
+
     function initializeMarket(bytes32 conditionId, bytes32 questionId) public {
         DataTypes.PolymarketTokenInfo memory info = _initializePolymarketInfo(conditionId, questionId);
         _initializeMarket(conditionId, info.yesPositionId, info.noPositionId, info.negRisk);

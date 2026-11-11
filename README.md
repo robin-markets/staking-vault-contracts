@@ -10,7 +10,7 @@ Robin Markets is a DeFi protocol on Polygon that lets users stake Polymarket pre
 
 | Contract          | Proxy                                                                                                                      | Current implementation                                                                                                     |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| RobinStakingVault | [`0xcb7444981296D08dA7161B75378e3773DbF5D806`](https://polygonscan.com/address/0xcb7444981296D08dA7161B75378e3773DbF5D806) | [`0x617e46bA1e532c05128E87d596e3989e172DbfF4`](https://polygonscan.com/address/0x617e46bA1e532c05128E87d596e3989e172DbfF4) |
+| RobinStakingVault | [`0xcb7444981296D08dA7161B75378e3773DbF5D806`](https://polygonscan.com/address/0xcb7444981296D08dA7161B75378e3773DbF5D806) | [`0x831f05F142a3bA0dbA6E51C6F90999D84B37f03A`](https://polygonscan.com/address/0x831f05F142a3bA0dbA6E51C6F90999D84B37f03A) |
 | RobinTwapOracle   | [`0xf08a02deeB4C7A09fAc8e8C6f8508D724612796f`](https://polygonscan.com/address/0xf08a02deeB4C7A09fAc8e8C6f8508D724612796f) | [`0x229897a014153b67ca0B1f895Ca99fABeC287De1`](https://polygonscan.com/address/0x229897a014153b67ca0B1f895Ca99fABeC287De1) |
 
 ### Non-upgradeable

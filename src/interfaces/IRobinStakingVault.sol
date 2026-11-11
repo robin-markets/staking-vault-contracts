@@ -96,6 +96,28 @@ interface IRobinStakingVault is
     /// @param wordPos The word position to invalidate (invalidates nonces wordPos*256 to wordPos*256+255)
     function invalidateNonceWord(address user, DataTypes.SignatureType signatureType, uint256 wordPos) external;
 
+    // ============ Operator Functions - Withdrawal ============
+
+    /// @notice Withdraw `user`'s shares on their behalf (OPERATOR_ROLE). Outcome tokens and yield
+    ///         are paid to `user`; the operator cannot choose another recipient.
+    /// @dev Wind-down exit for accounts that can no longer call the vault themselves (e.g. Polymarket
+    ///      DepositWallets whose relayer only forwards calls to Polymarket contracts). Same
+    ///      ordering/length rules as `batchWithdraw`; emits `Withdrawn` with `user` and referral code 0.
+    ///      Yield is always wrapped to PolyUSD (plain USDC.e only if the onramp call fails); reverts
+    ///      with `PolymarketOnrampNotSet` if yield is due and no onramp is configured.
+    /// @param user The share owner to withdraw for; receives the outcome tokens and the yield
+    /// @param conditionIds Array of condition IDs, sorted strictly ascending
+    /// @param yesShares Array of YES shares to burn per market (same order as conditionIds)
+    /// @param noShares Array of NO shares to burn per market (same order as conditionIds)
+    /// @param nonZeroLength Count of non-zero entries across yesShares and noShares
+    function operatorWithdraw(
+        address user,
+        bytes32[] calldata conditionIds,
+        uint256[] calldata yesShares,
+        uint256[] calldata noShares,
+        uint256 nonZeroLength
+    ) external;
+
     // ============ Market Initialization ============
 
     /// @notice Initialize a market; Typically called by the backend right before a user transaction to save gas for the user
